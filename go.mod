@@ -1,4 +1,4 @@
-module github.com/HeapOfChaos/goondvr
+module github.com/NitroOxid/goondvr
 
 go 1.23.0
 

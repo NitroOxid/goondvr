@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/server"
 )
 
 // Req represents an HTTP client with customized settings.

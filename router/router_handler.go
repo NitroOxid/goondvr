@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/entity"
-	"github.com/HeapOfChaos/goondvr/internal"
-	"github.com/HeapOfChaos/goondvr/manager"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/entity"
+	"github.com/NitroOxid/goondvr/internal"
+	"github.com/NitroOxid/goondvr/manager"
+	"github.com/NitroOxid/goondvr/server"
 	"github.com/gin-gonic/gin"
 )
 

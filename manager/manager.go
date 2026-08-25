@@ -13,11 +13,11 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/channel"
-	"github.com/HeapOfChaos/goondvr/entity"
-	"github.com/HeapOfChaos/goondvr/notifier"
-	"github.com/HeapOfChaos/goondvr/router/view"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/channel"
+	"github.com/NitroOxid/goondvr/entity"
+	"github.com/NitroOxid/goondvr/notifier"
+	"github.com/NitroOxid/goondvr/router/view"
+	"github.com/NitroOxid/goondvr/server"
 	"github.com/r3labs/sse/v2"
 )
 

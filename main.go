@@ -7,11 +7,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/HeapOfChaos/goondvr/config"
-	"github.com/HeapOfChaos/goondvr/entity"
-	"github.com/HeapOfChaos/goondvr/manager"
-	"github.com/HeapOfChaos/goondvr/router"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/config"
+	"github.com/NitroOxid/goondvr/entity"
+	"github.com/NitroOxid/goondvr/manager"
+	"github.com/NitroOxid/goondvr/router"
+	"github.com/NitroOxid/goondvr/server"
 	"github.com/urfave/cli/v2"
 )
 

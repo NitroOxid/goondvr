@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/entity"
-	"github.com/HeapOfChaos/goondvr/router/view"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/entity"
+	"github.com/NitroOxid/goondvr/router/view"
+	"github.com/NitroOxid/goondvr/server"
 	"github.com/gin-gonic/gin"
 )
 

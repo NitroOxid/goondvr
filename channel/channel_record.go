@@ -7,12 +7,12 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/chaturbate"
-	"github.com/HeapOfChaos/goondvr/internal"
-	"github.com/HeapOfChaos/goondvr/notifier"
-	"github.com/HeapOfChaos/goondvr/server"
-	"github.com/HeapOfChaos/goondvr/site"
-	"github.com/HeapOfChaos/goondvr/stripchat"
+	"github.com/NitroOxid/goondvr/chaturbate"
+	"github.com/NitroOxid/goondvr/internal"
+	"github.com/NitroOxid/goondvr/notifier"
+	"github.com/NitroOxid/goondvr/server"
+	"github.com/NitroOxid/goondvr/site"
+	"github.com/NitroOxid/goondvr/stripchat"
 	"github.com/avast/retry-go/v4"
 )
 

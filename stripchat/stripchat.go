@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/HeapOfChaos/goondvr/internal"
-	"github.com/HeapOfChaos/goondvr/site"
+	"github.com/NitroOxid/goondvr/internal"
+	"github.com/NitroOxid/goondvr/site"
 )
 
 // Stripchat implements site.Site for the Stripchat platform.

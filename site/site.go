@@ -3,7 +3,7 @@ package site
 import (
 	"context"
 
-	"github.com/HeapOfChaos/goondvr/internal"
+	"github.com/NitroOxid/goondvr/internal"
 )
 
 // StreamInfo holds live stream data returned by a site when a channel is online.

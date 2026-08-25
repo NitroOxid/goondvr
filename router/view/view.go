@@ -8,7 +8,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/HeapOfChaos/goondvr/entity"
+	"github.com/NitroOxid/goondvr/entity"
 )
 
 //go:embed templates

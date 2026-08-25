@@ -1,5 +1,5 @@
 package server
 
-import "github.com/HeapOfChaos/goondvr/entity"
+import "github.com/NitroOxid/goondvr/entity"
 
 var Config *entity.Config

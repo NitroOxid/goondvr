@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/internal"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/internal"
+	"github.com/NitroOxid/goondvr/server"
 )
 
 // knownPDKeys maps pkey (from #EXT-X-MOUFLON:PSCH:v2:{pkey}) to pdkey (decryption key).

@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/HeapOfChaos/goondvr/chaturbate"
-	"github.com/HeapOfChaos/goondvr/server"
+	"github.com/NitroOxid/goondvr/chaturbate"
+	"github.com/NitroOxid/goondvr/server"
 )
 
 // Pattern holds the date/time and sequence information for the filename pattern

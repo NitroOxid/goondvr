@@ -1,7 +1,7 @@
 package config
 
 import (
-	"github.com/HeapOfChaos/goondvr/entity"
+	"github.com/NitroOxid/goondvr/entity"
 	"github.com/urfave/cli/v2"
 )
 

@@ -26,7 +26,7 @@ Example dashboard and settings views from the current web UI.
 
 # Getting Started
 
-Go to the [📦 Releases page](https://github.com/HeapOfChaos/goondvr/releases) and download the appropriate binary. (e.g., `windows_amd64_goondvr.exe`)
+Go to the [📦 Releases page](https://github.com/NitroOxid/goondvr/releases) and download the appropriate binary. (e.g., `windows_amd64_goondvr.exe`)
 
 ## 🌐 Launching the Web UI
 
@@ -66,7 +66,7 @@ This starts recording immediately. The Web UI will be disabled.
 
 ## 🐳 Running with Docker
 
-Pre-built image from [GitHub Container Registry](https://github.com/HeapOfChaos/goondvr/pkgs/container/goondvr):
+Pre-built image from [GitHub Container Registry](https://github.com/NitroOxid/goondvr/pkgs/container/goondvr):
 
 Persist `./videos` for recordings and `./conf` for saved channels and settings.
 
@@ -100,7 +100,7 @@ $ docker run -d \
     goondvr
 ```
 
-...Or use [`docker-compose.yml`](https://github.com/HeapOfChaos/goondvr/blob/master/docker-compose.yml):
+...Or use [`docker-compose.yml`](https://github.com/NitroOxid/goondvr/blob/master/docker-compose.yml):
 
 ```bash
 $ docker compose up -d
@@ -267,7 +267,7 @@ _Note: Legacy HLS streams are saved as `.ts`. LL-HLS streams are saved as `.mp4`
 
 **Q: The program closes immediately on Windows.**
 
-> Open it via **Command Prompt**, the error message should appear. If needed, [create an issue](https://github.com/HeapOfChaos/goondvr/issues).
+> Open it via **Command Prompt**, the error message should appear. If needed, [create an issue](https://github.com/NitroOxid/goondvr/issues).
 
 &nbsp;
 

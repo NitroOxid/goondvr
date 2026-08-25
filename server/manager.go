@@ -3,7 +3,7 @@ package server
 import (
 	"net/http"
 
-	"github.com/HeapOfChaos/goondvr/entity"
+	"github.com/NitroOxid/goondvr/entity"
 )
 
 var Manager IManager
