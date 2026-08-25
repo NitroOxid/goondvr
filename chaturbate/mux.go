@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 )
@@ -353,14 +354,7 @@ type tfdtPatch struct {
 }
 
 // BuildSeekIndex scans a completed fragmented MP4 file, normalises tfdt
-// decode times to start from zero (so VLC displays correct timestamps
-// instead of the live-stream's wall-clock offset, e.g. "44:00"), builds an
-// mfra (Movie Fragment Random Access) box containing tfra entries for every
-// moof fragment, and appends it to the file.  It is a no-op if the file
-// already has an mfra box or contains no moof boxes.
-//
-// The scan is streaming: only one moof box is held in memory at a time,
-// so memory usage is O(number of fragments), not O(file size).
+// decode times to start from zero, builds an mfra box, and appends it.
 func BuildSeekIndex(path string) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -376,11 +370,10 @@ func BuildSeekIndex(path string) error {
 		return nil
 	}
 
-	trackEntries := map[uint32][]tfraEntry{} // track_id -> entries
+	trackEntries := map[uint32][]tfraEntry{}
+	trackTimescales := map[uint32]uint64{}
 	var patches []tfdtPatch
 
-	// Pass 1: walk top-level boxes by reading 8-byte headers and seeking.
-	// Only moof boxes are read into memory (typically a few KB each).
 	var pos int64
 	hdr := make([]byte, 8)
 	for pos+8 <= fileSize {
@@ -394,9 +387,14 @@ func BuildSeekIndex(path string) error {
 		}
 
 		if boxType == "mfra" {
-			return nil // already indexed
+			return nil
 		}
-
+		if boxType == "moov" {
+			moovData := make([]byte, size-8)
+			if _, err := f.ReadAt(moovData, pos+8); err == nil {
+				extractTrackTimescales(moovData, trackTimescales)
+			}
+		}
 		if boxType == "moof" {
 			moofData := make([]byte, size-8)
 			if _, err := f.ReadAt(moofData, pos+8); err != nil {
@@ -418,19 +416,42 @@ func BuildSeekIndex(path string) error {
 		return nil
 	}
 
-	// Compute per-track minimum baseMediaDecodeTime.
-	minTimes := map[uint32]uint64{}
+	type trackInfo struct {
+		minTime   uint64
+		timescale uint64
+	}
+	infos := map[uint32]trackInfo{}
 	for id, entries := range trackEntries {
-		min := entries[0].time
+		trackMin := entries[0].time
 		for _, e := range entries[1:] {
-			if e.time < min {
-				min = e.time
+			if e.time < trackMin {
+				trackMin = e.time
 			}
 		}
-		minTimes[id] = min
+		ts := trackTimescales[id]
+		if ts == 0 {
+			ts = 90000
+		}
+		infos[id] = trackInfo{minTime: trackMin, timescale: ts}
 	}
 
-	// Pass 2: patch tfdt values in-place using pwrite (no full-file rewrite).
+	globalMinSec := -1.0
+	for _, info := range infos {
+		sec := float64(info.minTime) / float64(info.timescale)
+		if globalMinSec < 0 || sec < globalMinSec {
+			globalMinSec = sec
+		}
+	}
+
+	minTimes := map[uint32]uint64{}
+	for id, info := range infos {
+		shift := uint64(math.Round(globalMinSec * float64(info.timescale)))
+		if shift > info.minTime {
+			shift = info.minTime
+		}
+		minTimes[id] = shift
+	}
+
 	for _, p := range patches {
 		minT := minTimes[p.trackID]
 		if minT == 0 {
@@ -459,7 +480,6 @@ func BuildSeekIndex(path string) error {
 		}
 	}
 
-	// Adjust collected entry times to match rewritten values.
 	for id := range trackEntries {
 		minT := minTimes[id]
 		for i := range trackEntries[id] {
@@ -469,7 +489,6 @@ func BuildSeekIndex(path string) error {
 		}
 	}
 
-	// Append mfra box at end of file.
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return fmt.Errorf("seek to end: %w", err)
 	}
@@ -478,6 +497,63 @@ func BuildSeekIndex(path string) error {
 		return fmt.Errorf("write mfra: %w", err)
 	}
 	return nil
+}
+
+// extractTrackTimescales reads a moov box's content (without its 8-byte header)
+// and populates timescales with the mdhd.timescale for each trak's track_id.
+func extractTrackTimescales(moovContent []byte, timescales map[uint32]uint64) {
+	boxes, _ := parseMP4Boxes(moovContent)
+	for _, b := range boxes {
+		if b.typ != "trak" {
+			continue
+		}
+		trakContent := b.data[8:]
+		// read track_id from tkhd
+		var trackID uint32
+		trakBoxes, _ := parseMP4Boxes(trakContent)
+		for _, tb := range trakBoxes {
+			if tb.typ == "tkhd" && len(tb.data) >= 9 {
+				version := tb.data[8]
+				var idOff int
+				if version == 0 {
+					idOff = 20
+				} else {
+					idOff = 28
+				}
+				if idOff+4 <= len(tb.data) {
+					trackID = binary.BigEndian.Uint32(tb.data[idOff:])
+				}
+				break
+			}
+		}
+		if trackID == 0 {
+			continue
+		}
+		// read timescale from mdia > mdhd
+		for _, tb := range trakBoxes {
+			if tb.typ != "mdia" {
+				continue
+			}
+			mdiaBoxes, _ := parseMP4Boxes(tb.data[8:])
+			for _, mb := range mdiaBoxes {
+				if mb.typ == "mdhd" && len(mb.data) >= 9 {
+					version := mb.data[8]
+					var tsOff int
+					if version == 0 {
+						tsOff = 20
+					} else {
+						tsOff = 28
+					}
+					if tsOff+4 <= len(mb.data) {
+						ts := uint64(binary.BigEndian.Uint32(mb.data[tsOff:]))
+						if ts > 0 {
+							timescales[trackID] = ts
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 // scanMoofForIndex parses moof content (without the 8-byte box header) and
@@ -560,7 +636,7 @@ func scanTrafForIndex(trafContent []byte, trafFileOffset int64) (uint32, uint64,
 }
 
 // normaliseTfdt subtracts the per-track minimum baseMediaDecodeTime from
-// every tfdt box found inside moof boxes in data.  data is modified in-place.
+// every tfdt box found inside moof boxes in data. data is modified in-place.
 func normaliseTfdt(data []byte, minTimes map[uint32]uint64) {
 	pos := 0
 	for pos+8 <= len(data) {
@@ -584,6 +660,50 @@ func normaliseTfdt(data []byte, minTimes map[uint32]uint64) {
 		}
 		pos += size
 	}
+}
+
+// extractTimescaleFromInit returns the timescale for the first track found in an
+// fMP4 init segment (moov > trak > mdia > mdhd.timescale). Returns 0, false on
+// any parse failure.
+func extractTimescaleFromInit(data []byte) (uint64, bool) {
+	moovBox, ok := findMP4Box(data, "moov")
+	if !ok {
+		return 0, false
+	}
+	trakBox, ok := findMP4Box(moovBox[8:], "trak")
+	if !ok {
+		return 0, false
+	}
+	mdiaBox, ok := findMP4Box(trakBox[8:], "mdia")
+	if !ok {
+		return 0, false
+	}
+	mdhdBox, ok := findMP4Box(mdiaBox[8:], "mdhd")
+	if !ok {
+		return 0, false
+	}
+
+	// mdhd layout (full box including 8-byte size+type header):
+	//   [8]      version
+	//   [9:12]   flags
+	//   version 0: [12:16] creation, [16:20] modification, [20:24] timescale
+	//   version 1: [12:20] creation, [20:28] modification, [28:32] timescale
+	if len(mdhdBox) < 9 {
+		return 0, false
+	}
+
+	version := mdhdBox[8]
+	if version == 0 && len(mdhdBox) >= 24 {
+		ts := uint64(binary.BigEndian.Uint32(mdhdBox[20:]))
+		return ts, ts > 0
+	}
+
+	if version == 1 && len(mdhdBox) >= 32 {
+		ts := uint64(binary.BigEndian.Uint32(mdhdBox[28:]))
+		return ts, ts > 0
+	}
+
+	return 0, false
 }
 
 // extractMoofFirstTfdt returns the baseMediaDecodeTime from the first moof found

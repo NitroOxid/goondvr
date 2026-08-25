@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"sort"
 	"strconv"
@@ -25,9 +26,7 @@ import (
 type Chaturbate struct{}
 
 // New returns a new Chaturbate site implementation.
-func New() *Chaturbate {
-	return &Chaturbate{}
-}
+func New() *Chaturbate { return &Chaturbate{} }
 
 // FetchStream implements site.Site. It returns *site.StreamInfo if online, nil if offline.
 func (cb *Chaturbate) FetchStream(ctx context.Context, req *internal.Req, username string) (*site.StreamInfo, error) {
@@ -71,9 +70,7 @@ type Client struct {
 	Req *internal.Req
 }
 
-func NewClient() *Client {
-	return &Client{Req: internal.NewReq()}
-}
+func NewClient() *Client { return &Client{Req: internal.NewReq()} }
 
 func (c *Client) GetStream(ctx context.Context, username string) (*Stream, error) {
 	return FetchStream(ctx, c.Req, username)
@@ -328,10 +325,8 @@ func PickPlaylist(masterPlaylist *m3u8.MasterPlaylist, baseURL string, resolutio
 		return nil, fmt.Errorf("resolution not found")
 	}
 
-	var (
-		finalResolution = variant.Width
-		finalFramerate  = framerate
-	)
+	finalResolution := variant.Width
+	finalFramerate := framerate
 	playlistURL, exists := variant.Framerate[framerate]
 	if !exists {
 		for fr, u := range variant.Framerate {
@@ -502,7 +497,7 @@ func normalizeM3U8(resp string) string {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "#EXTINF:") && !strings.Contains(trimmed, ",") {
-			trimmed = trimmed + ","
+			trimmed += ","
 		}
 		out = append(out, trimmed)
 	}
@@ -520,9 +515,7 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 	lastMapURI := ""
 	consecutiveErrors := 0
 
-	// For fMP4 streams, normalise tfdt timestamps so the recording starts
-	// at 0:00 instead of the CDN's absolute stream uptime. Always attempt
-	// this — extractAllTrackBaseTimes returns nil on non-fMP4 (.ts) data.
+	// Normalise fMP4 timestamps so the recording starts at 0:00.
 	var trackBaseTimes map[uint32]uint64
 
 	for {
@@ -536,15 +529,6 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 		}
 		pl, _, err := safeDecodeFrom(strings.NewReader(normalizeM3U8(decodeMouflon(resp, p.MouflonPDKey))))
 		if err != nil {
-			if server.Config.Debug {
-				fmt.Printf("[DEBUG] variant playlist parse failed: %v\n", err)
-				fmt.Printf("[DEBUG]   Playlist URL: %s\n", p.PlaylistURL)
-				end := len(resp)
-				if end > 2000 {
-					end = 2000
-				}
-				fmt.Printf("[DEBUG]   Response (first 2000 chars):\n%s\n", resp[:end])
-			}
 			if consecutiveErrors++; consecutiveErrors >= 5 {
 				return fmt.Errorf("decode from: %w", err)
 			}
@@ -585,11 +569,8 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 				if seq <= lastSeq {
 					continue
 				}
-				lastSeq = seq
-			} else {
-				if v.URI == lastSegURI {
-					continue
-				}
+			} else if v.URI == lastSegURI {
+				continue
 			}
 			lastSegURI = v.URI
 			if v.Map != nil && v.Map.URI != lastMapURI {
@@ -603,8 +584,6 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 				}
 				lastMapURI = v.Map.URI
 			}
-
-			lastSeq = seq
 
 			pipeline := func() ([]byte, error) {
 				return client.GetBytes(ctx, resolveHLSURL(p.RootURL, v.URI))
@@ -641,46 +620,80 @@ func (p *Playlist) watchVideoOnlySegments(ctx context.Context, handler WatchHand
 			if err := handler(resp, v.Duration); err != nil {
 				return fmt.Errorf("handler: %w", err)
 			}
+			if seq != -1 {
+				lastSeq = seq
+			}
 		}
 
 		<-time.After(1 * time.Second)
 	}
 }
 
-// watchMuxedSegments polls both video and audio LL-HLS playlists, combines their
-// init segments into a single fMP4 init, then writes interleaved video and
-// audio moof+mdat fragments. Audio track_id is renumbered to 2.
-// tfdt decode times are normalised to start from zero so players display the
-// correct recording position rather than the CDN stream uptime offset.
+// watchMuxedSegments downloads video/audio independently and orders fragments
+// by a common tfdt/timescale presentation timeline. Sequence state is advanced
+// only after a fragment has been successfully downloaded and parsed.
 func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler) error {
 	client := p.Client
 	if client == nil {
 		client = internal.NewMediaReq()
 	}
 
-	lastVideoSeq := -1
-	lastAudioSeq := -1
-	lastVideoURI := ""
-	lastAudioURI := ""
-	lastVideoMapURI := ""
-	lastAudioMapURI := ""
-	var videoInitBytes []byte
-	var audioInitBytes []byte
-	initWritten := false
-	consecutiveErrors := 0
+	type pendingSeg struct {
+		track       string
+		presentTime float64
+		duration    float64
+		data        []byte
+	}
 
-	// Per-track tfdt base times captured from the first segment of each track.
-	// Subtracting these normalises timestamps to start from zero.
-	var videoTimeBase uint64
-	var audioTimeBase uint64
-	videoBaseSet := false
-	audioBaseSet := false
+	var (
+		lastVideoSeq    = -1
+		lastAudioSeq    = -1
+		lastVideoURI    string
+		lastAudioURI    string
+		lastVideoMapURI string
+		lastAudioMapURI string
+
+		videoInitBytes []byte
+		audioInitBytes []byte
+		initWritten    bool
+
+		videoTimescale uint64
+		audioTimescale uint64
+		videoTimeBase  uint64
+		audioTimeBase  uint64
+		videoBaseSet   bool
+		audioBaseSet   bool
+		syncComputed   bool
+
+		videoShift uint64
+		audioShift uint64
+
+		pending         []pendingSeg
+		consecutiveErrs int
+	)
+
+	resetTimeline := func(reason string) {
+		if server.Config.Debug {
+			fmt.Printf("[sync] muxed: resetting timeline: %s\n", reason)
+		}
+		videoInitBytes, audioInitBytes = nil, nil
+		initWritten = false
+		videoTimescale, audioTimescale = 0, 0
+		videoTimeBase, audioTimeBase = 0, 0
+		videoBaseSet, audioBaseSet = false, false
+		syncComputed = false
+		videoShift, audioShift = 0, 0
+		pending = nil
+		lastVideoSeq, lastAudioSeq = -1, -1
+		lastVideoURI, lastAudioURI = "", ""
+		lastVideoMapURI, lastAudioMapURI = "", ""
+	}
 
 	for {
 		// Fetch video playlist
 		videoResp, err := client.Get(ctx, p.PlaylistURL)
 		if err != nil {
-			if consecutiveErrors++; consecutiveErrors >= 5 {
+			if consecutiveErrs++; consecutiveErrs >= 5 {
 				return fmt.Errorf("get video playlist: %w", err)
 			}
 			<-time.After(2 * time.Second)
@@ -688,10 +701,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		}
 		vpl, _, err := safeDecodeFrom(strings.NewReader(normalizeM3U8(decodeMouflon(videoResp, p.MouflonPDKey))))
 		if err != nil {
-			if server.Config.Debug {
-				fmt.Printf("[DEBUG] muxed: video playlist parse failed: %v\n", err)
-			}
-			if consecutiveErrors++; consecutiveErrors >= 5 {
+			if consecutiveErrs++; consecutiveErrs >= 5 {
 				return fmt.Errorf("decode video playlist: %w", err)
 			}
 			<-time.After(2 * time.Second)
@@ -705,7 +715,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		// Fetch audio playlist
 		audioResp, err := client.Get(ctx, p.AudioPlaylistURL)
 		if err != nil {
-			if consecutiveErrors++; consecutiveErrors >= 5 {
+			if consecutiveErrs++; consecutiveErrs >= 5 {
 				return fmt.Errorf("get audio playlist: %w", err)
 			}
 			<-time.After(2 * time.Second)
@@ -713,10 +723,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		}
 		apl, _, err := safeDecodeFrom(strings.NewReader(normalizeM3U8(decodeMouflon(audioResp, p.MouflonPDKey))))
 		if err != nil {
-			if server.Config.Debug {
-				fmt.Printf("[DEBUG] muxed: audio playlist parse failed: %v\n", err)
-			}
-			if consecutiveErrors++; consecutiveErrors >= 5 {
+			if consecutiveErrs++; consecutiveErrs >= 5 {
 				return fmt.Errorf("decode audio playlist: %w", err)
 			}
 			<-time.After(2 * time.Second)
@@ -726,45 +733,61 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 		if !ok {
 			return fmt.Errorf("cast audio playlist to media playlist")
 		}
-		consecutiveErrors = 0
 
-		// Collect video init segment (EXT-X-MAP)
+		consecutiveErrs = 0
+
+		// Detect init changes
+		var videoMap, audioMap *m3u8.Map
 		for _, v := range videoPlaylist.Segments {
-			if v == nil {
-				continue
+			if v != nil && v.Map != nil {
+				videoMap = v.Map
+				break
 			}
-			if v.Map != nil && v.Map.URI != lastVideoMapURI {
-				mapURL := resolveHLSURL(p.RootURL, v.Map.URI)
-				b, err := client.GetBytes(ctx, mapURL)
-				if err != nil {
-					return fmt.Errorf("get video init segment: %w", err)
-				}
-				videoInitBytes = b
-				lastVideoMapURI = v.Map.URI
-				initWritten = false
-			}
-			break
 		}
-
-		// Collect audio init segment (EXT-X-MAP)
 		for _, v := range audioPlaylist.Segments {
-			if v == nil {
-				continue
+			if v != nil && v.Map != nil {
+				audioMap = v.Map
+				break
 			}
-			if v.Map != nil && v.Map.URI != lastAudioMapURI {
-				mapURL := resolveHLSURL(p.AudioPlaylistURL, v.Map.URI)
-				b, err := client.GetBytes(ctx, mapURL)
-				if err != nil {
-					return fmt.Errorf("get audio init segment: %w", err)
-				}
-				audioInitBytes = b
-				lastAudioMapURI = v.Map.URI
-				initWritten = false
-			}
-			break
 		}
 
-		// Write combined init once we have both init segments
+		if videoMap != nil && videoMap.URI != lastVideoMapURI {
+			resetTimeline("video init changed")
+		}
+		if audioMap != nil && audioMap.URI != lastAudioMapURI {
+			resetTimeline("audio init changed")
+		}
+
+		// Fetch current init pair if changed
+		if videoMap != nil && videoMap.URI != lastVideoMapURI {
+			b, err := client.GetBytes(ctx, resolveHLSURL(p.RootURL, videoMap.URI))
+			if err != nil {
+				return fmt.Errorf("get video init segment: %w", err)
+			}
+			videoInitBytes = b
+			lastVideoMapURI = videoMap.URI
+			if ts, ok := extractTimescaleFromInit(b); ok {
+				videoTimescale = ts
+			} else {
+				return fmt.Errorf("cannot determine video timescale from init")
+			}
+		}
+
+		if audioMap != nil && audioMap.URI != lastAudioMapURI {
+			b, err := client.GetBytes(ctx, resolveHLSURL(p.AudioPlaylistURL, audioMap.URI))
+			if err != nil {
+				return fmt.Errorf("get audio init segment: %w", err)
+			}
+			audioInitBytes = b
+			lastAudioMapURI = audioMap.URI
+			if ts, ok := extractTimescaleFromInit(b); ok {
+				audioTimescale = ts
+			} else {
+				return fmt.Errorf("cannot determine audio timescale from init")
+			}
+		}
+
+		// Write combined init
 		if !initWritten && videoInitBytes != nil && audioInitBytes != nil {
 			combined, err := buildCombinedInit(videoInitBytes, audioInitBytes)
 			if err != nil {
@@ -775,242 +798,187 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			}
 			initWritten = true
 		}
+
 		if !initWritten {
 			<-time.After(1 * time.Second)
 			continue
 		}
 
-		// Collect new segment URLs. Pre-resolve URLs to avoid closure capture
-		// issues, and fall back to URI-string dedup when seq is unavailable.
-		type segInfo struct {
-			url      string
-			duration float64
-		}
-		var newVideoSegs []segInfo
+		// Download video fragments
 		for _, v := range videoPlaylist.Segments {
 			if v == nil {
 				continue
 			}
 			seq := internal.SegmentSeq(v.URI)
-			if server.Config.Debug && lastVideoSeq == -1 && lastVideoURI == "" {
-				fmt.Printf("[DEBUG] muxed: first video segment URI: %s (seq=%d)\n", v.URI, seq)
+			if seq == -1 && v.SeqId > 0 {
+				seq = int(v.SeqId)
 			}
+
+			if seq != -1 && seq <= lastVideoSeq {
+				continue
+			}
+			if seq == -1 && v.URI == lastVideoURI {
+				continue
+			}
+
+			segURL := resolveHLSURL(p.RootURL, v.URI)
+			segBytes, err := retry.DoWithData(
+				func() ([]byte, error) { return client.GetBytes(ctx, segURL) },
+				retry.Context(ctx),
+				retry.Attempts(3),
+				retry.Delay(600*time.Millisecond),
+				retry.DelayType(retry.FixedDelay),
+				retry.RetryIf(func(err error) bool { return !errors.Is(err, internal.ErrNotFound) }),
+			)
+			if err != nil {
+				if server.Config.Debug {
+					fmt.Printf("[DEBUG] muxed video segment skipped: seq=%d err=%v\n", seq, err)
+				}
+				continue
+			}
+
+			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
+			if !ok {
+				if server.Config.Debug {
+					fmt.Printf("[DEBUG] muxed video segment has no tfdt: seq=%d\n", seq)
+				}
+				continue
+			}
+
+			if videoTimescale == 0 {
+				return fmt.Errorf("video timescale is zero")
+			}
+
+			if !videoBaseSet {
+				videoTimeBase = rawTfdt
+				videoBaseSet = true
+				if server.Config.Debug {
+					fmt.Printf("[sync] muxed: video first tfdt=%d (%.6fs)\n", rawTfdt, float64(rawTfdt)/float64(videoTimescale))
+				}
+			}
+
 			if seq != -1 {
-				if seq <= lastVideoSeq {
-					continue
-				}
 				lastVideoSeq = seq
-			} else {
-				if v.URI == lastVideoURI {
-					continue
-				}
 			}
 			lastVideoURI = v.URI
-			newVideoSegs = append(newVideoSegs, segInfo{
-				url:      resolveHLSURL(p.RootURL, v.URI),
-				duration: v.Duration,
+
+			pending = append(pending, pendingSeg{
+				track:       "video",
+				presentTime: float64(rawTfdt) / float64(videoTimescale),
+				duration:    v.Duration,
+				data:        segBytes,
 			})
 		}
-		var newAudioSegs []segInfo
+
+		// Download audio fragments
 		for _, v := range audioPlaylist.Segments {
 			if v == nil {
 				continue
 			}
 			seq := internal.SegmentSeq(v.URI)
-			if server.Config.Debug && lastAudioSeq == -1 && lastAudioURI == "" {
-				fmt.Printf("[DEBUG] muxed: first audio segment URI: %s (seq=%d)\n", v.URI, seq)
+			if seq == -1 && v.SeqId > 0 {
+				seq = int(v.SeqId)
 			}
+
+			if seq != -1 && seq <= lastAudioSeq {
+				continue
+			}
+			if seq == -1 && v.URI == lastAudioURI {
+				continue
+			}
+
+			segURL := resolveHLSURL(p.AudioPlaylistURL, v.URI)
+			segBytes, err := retry.DoWithData(
+				func() ([]byte, error) { return client.GetBytes(ctx, segURL) },
+				retry.Context(ctx),
+				retry.Attempts(3),
+				retry.Delay(600*time.Millisecond),
+				retry.DelayType(retry.FixedDelay),
+				retry.RetryIf(func(err error) bool { return !errors.Is(err, internal.ErrNotFound) }),
+			)
+			if err != nil {
+				if server.Config.Debug {
+					fmt.Printf("[DEBUG] muxed audio segment skipped: seq=%d err=%v\n", seq, err)
+				}
+				continue
+			}
+
+			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
+			if !ok {
+				if server.Config.Debug {
+					fmt.Printf("[DEBUG] muxed audio segment has no tfdt: seq=%d\n", seq)
+				}
+				continue
+			}
+
+			if audioTimescale == 0 {
+				return fmt.Errorf("audio timescale is zero")
+			}
+
+			if !audioBaseSet {
+				audioTimeBase = rawTfdt
+				audioBaseSet = true
+				if server.Config.Debug {
+					fmt.Printf("[sync] muxed: audio first tfdt=%d (%.6fs)\n", rawTfdt, float64(rawTfdt)/float64(audioTimescale))
+				}
+			}
+
 			if seq != -1 {
-				if seq <= lastAudioSeq {
-					continue
-				}
 				lastAudioSeq = seq
-			} else {
-				if v.URI == lastAudioURI {
-					continue
-				}
 			}
 			lastAudioURI = v.URI
-			newAudioSegs = append(newAudioSegs, segInfo{
-				url:      resolveHLSURL(p.AudioPlaylistURL, v.URI),
-				duration: v.Duration,
+
+			segBytes = rewriteAudioMoofTrackID(segBytes)
+
+			pending = append(pending, pendingSeg{
+				track:       "audio",
+				presentTime: float64(rawTfdt) / float64(audioTimescale),
+				duration:    0,
+				data:        segBytes,
 			})
 		}
 
-		if server.Config.Debug {
-			fmt.Printf("[DEBUG] muxed: cycle video=%d audio=%d\n", len(newVideoSegs), len(newAudioSegs))
+		// Compute sync shifts once both bases are known
+		if !syncComputed && videoBaseSet && audioBaseSet {
+			videoStart := float64(videoTimeBase) / float64(videoTimescale)
+			audioStart := float64(audioTimeBase) / float64(audioTimescale)
+			minStart := videoStart
+			if audioStart < minStart {
+				minStart = audioStart
+			}
+
+			videoShift = uint64(math.Round(minStart * float64(videoTimescale)))
+			audioShift = uint64(math.Round(minStart * float64(audioTimescale)))
+			syncComputed = true
+
+			if server.Config.Debug {
+				fmt.Printf("[sync] muxed: video tfdt=%d ts=%d (%.6fs) audio tfdt=%d ts=%d (%.6fs) common=%.6fs drift=%.3fms\n",
+					videoTimeBase, videoTimescale, videoStart,
+					audioTimeBase, audioTimescale, audioStart,
+					minStart, (videoStart-audioStart)*1000)
+			}
 		}
 
-		isStripchatMux := strings.Contains(p.PlaylistURL, "doppiocdn") || strings.Contains(p.AudioPlaylistURL, "doppiocdn")
-
-		// Stripchat can expose video/audio playlists with different cadence,
-		// and index-based pairing can produce files that begin with a long
-		// video-only run after a split. Keep Chaturbate on the original paired
-		// write order because it was already behaving correctly there.
-		if !isStripchatMux {
-			maxLen := len(newVideoSegs)
-			if len(newAudioSegs) > maxLen {
-				maxLen = len(newAudioSegs)
-			}
-			for i := 0; i < maxLen; i++ {
-				var chunk []byte
-				var chunkDuration float64
-
-				if i < len(newVideoSegs) {
-					vseg := newVideoSegs[i]
-					vsegURL := vseg.url
-					segBytes, err := retry.DoWithData(
-						func() ([]byte, error) { return client.GetBytes(ctx, vsegURL) },
-						retry.Context(ctx),
-						retry.Attempts(3),
-						retry.Delay(600*time.Millisecond),
-						retry.DelayType(retry.FixedDelay),
-					)
-					if err == nil {
-						if !videoBaseSet {
-							if t, ok := extractMoofFirstTfdt(segBytes); ok {
-								videoTimeBase = t
-								videoBaseSet = true
-							}
-						}
-						segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
-						chunk = append(chunk, segBytes...)
-						chunkDuration = vseg.duration
-					}
-				}
-				if i < len(newAudioSegs) {
-					aseg := newAudioSegs[i]
-					asegURL := aseg.url
-					segBytes, err := retry.DoWithData(
-						func() ([]byte, error) { return client.GetBytes(ctx, asegURL) },
-						retry.Context(ctx),
-						retry.Attempts(3),
-						retry.Delay(600*time.Millisecond),
-						retry.DelayType(retry.FixedDelay),
-					)
-					if err != nil {
-						fmt.Printf("[WARN] audio seg download failed: %v\n", err)
-					} else {
-						if !audioBaseSet {
-							if t, ok := extractMoofFirstTfdt(segBytes); ok {
-								audioTimeBase = t
-								audioBaseSet = true
-								if server.Config.Debug {
-									fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-								}
-							}
-						}
-						if server.Config.Debug {
-							if rawTfdt, ok := extractMoofFirstTfdt(segBytes); ok {
-								var normalised uint64
-								if audioTimeBase > 0 && rawTfdt >= audioTimeBase {
-									normalised = rawTfdt - audioTimeBase
-								}
-								fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalised)
-							}
-						}
-						segBytes = rewriteAudioMoofTrackID(segBytes)
-						segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
-						chunk = append(chunk, segBytes...)
-					}
-				}
-				if len(chunk) > 0 {
-					if err := handler(chunk, chunkDuration); err != nil {
-						return fmt.Errorf("handler muxed segment group: %w", err)
-					}
-				}
-			}
-
+		if !syncComputed {
 			<-time.After(1 * time.Second)
 			continue
 		}
 
-		// Merge Stripchat by actual fragment decode time rather than playlist index.
-		type pendingSeg struct {
-			track    string
-			time     uint64
-			duration float64
-			data     []byte
-		}
-		var pending []pendingSeg
-
-		for _, vseg := range newVideoSegs {
-			vsegURL := vseg.url
-			segBytes, err := retry.DoWithData(
-				func() ([]byte, error) { return client.GetBytes(ctx, vsegURL) },
-				retry.Context(ctx),
-				retry.Attempts(3),
-				retry.Delay(600*time.Millisecond),
-				retry.DelayType(retry.FixedDelay),
-			)
-			if err != nil {
-				fmt.Printf("[WARN] video seg download failed: %v\n", err)
-				continue
+		// Normalise timestamps and sort on the common timeline
+		for i := range pending {
+			seg := &pending[i]
+			if seg.track == "video" {
+				seg.presentTime -= float64(videoShift) / float64(videoTimescale)
+				seg.data = shiftSegmentTfdt(seg.data, 1, videoShift)
+			} else {
+				seg.presentTime -= float64(audioShift) / float64(audioTimescale)
+				seg.data = shiftSegmentTfdt(seg.data, 2, audioShift)
 			}
-
-			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
-			if !videoBaseSet && ok {
-				videoTimeBase = rawTfdt
-				videoBaseSet = true
-			}
-
-			normalisedTime := rawTfdt
-			if videoBaseSet && rawTfdt >= videoTimeBase {
-				normalisedTime = rawTfdt - videoTimeBase
-			}
-			segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
-			pending = append(pending, pendingSeg{
-				track:    "video",
-				time:     normalisedTime,
-				duration: vseg.duration,
-				data:     segBytes,
-			})
-		}
-
-		for _, aseg := range newAudioSegs {
-			asegURL := aseg.url
-			segBytes, err := retry.DoWithData(
-				func() ([]byte, error) { return client.GetBytes(ctx, asegURL) },
-				retry.Context(ctx),
-				retry.Attempts(3),
-				retry.Delay(600*time.Millisecond),
-				retry.DelayType(retry.FixedDelay),
-			)
-			if err != nil {
-				fmt.Printf("[WARN] audio seg download failed: %v\n", err)
-				continue
-			}
-
-			rawTfdt, ok := extractMoofFirstTfdt(segBytes)
-			if !audioBaseSet && ok {
-				audioTimeBase = rawTfdt
-				audioBaseSet = true
-				if server.Config.Debug {
-					fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-				}
-			}
-
-			normalisedTime := rawTfdt
-			if audioBaseSet && rawTfdt >= audioTimeBase {
-				normalisedTime = rawTfdt - audioTimeBase
-			}
-			if server.Config.Debug && ok {
-				fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalisedTime)
-			}
-
-			segBytes = rewriteAudioMoofTrackID(segBytes)
-			segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
-			pending = append(pending, pendingSeg{
-				track:    "audio",
-				time:     normalisedTime,
-				duration: 0,
-				data:     segBytes,
-			})
 		}
 
 		sort.SliceStable(pending, func(i, j int) bool {
-			if pending[i].time != pending[j].time {
-				return pending[i].time < pending[j].time
+			if pending[i].presentTime != pending[j].presentTime {
+				return pending[i].presentTime < pending[j].presentTime
 			}
 			return pending[i].track < pending[j].track
 		})
@@ -1021,6 +989,7 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			}
 		}
 
+		pending = nil
 		<-time.After(1 * time.Second)
 	}
 }
