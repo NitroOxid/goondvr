@@ -83,6 +83,14 @@ const siteAwareDefaultPattern = "videos/{{if ne .Site \"chaturbate\"}}{{.Site}}/
 type settings struct {
 	Cookies             string `json:"cookies"`
 	UserAgent           string `json:"user_agent"`
+	BrowserMode         string `json:"browser_mode,omitempty"`
+	BrowserPath         string `json:"browser_path,omitempty"`
+	BrowserProfileDir   string `json:"browser_profile_dir,omitempty"`
+	BrowserHelperURL    string `json:"browser_helper_url,omitempty"`
+	BrowserHelperToken  string `json:"browser_helper_token,omitempty"`
+	BrowserDebugPort    int    `json:"browser_debug_port,omitempty"`
+	BrowserBootstrap    bool   `json:"browser_bootstrap,omitempty"`
+	BrowserBootstrapURL string `json:"browser_bootstrap_url,omitempty"`
 	CompletedDir        string `json:"completed_dir,omitempty"`
 	FinalizeMode        string `json:"finalize_mode,omitempty"`
 	FFmpegEncoder       string `json:"ffmpeg_encoder,omitempty"`
@@ -102,11 +110,58 @@ type settings struct {
 	StripchatPDKey      string `json:"stripchat_pdkey,omitempty"`
 }
 
+func ensureConfDir() error {
+	if err := os.MkdirAll("./conf", 0700); err != nil {
+		return fmt.Errorf("mkdir conf: %w", err)
+	}
+	return nil
+}
+
+func ensureJSONFile(path string, defaultValue any) error {
+	if err := ensureConfDir(); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	b, err := json.MarshalIndent(defaultValue, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal default %s: %w", path, err)
+	}
+	b = append(b, '\n')
+
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		return fmt.Errorf("write default %s: %w", path, err)
+	}
+	return nil
+}
+
+func EnsureConfigPlaceholders() error {
+	if err := ensureJSONFile(settingsFile, settings{}); err != nil {
+		return err
+	}
+	if err := ensureJSONFile(channelsFile, []*entity.ChannelConfig{}); err != nil {
+		return err
+	}
+	return nil
+}
+
 // SaveSettings persists the current cookies and user-agent to disk.
 func SaveSettings() error {
 	s := settings{
 		Cookies:             server.Config.Cookies,
 		UserAgent:           server.Config.UserAgent,
+		BrowserMode:         server.Config.BrowserMode,
+		BrowserPath:         server.Config.BrowserPath,
+		BrowserProfileDir:   server.Config.BrowserProfileDir,
+		BrowserHelperURL:    server.Config.BrowserHelperURL,
+		BrowserHelperToken:  server.Config.BrowserHelperToken,
+		BrowserDebugPort:    server.Config.BrowserDebugPort,
+		BrowserBootstrap:    server.Config.BrowserBootstrap,
+		BrowserBootstrapURL: server.Config.BrowserBootstrapURL,
 		CompletedDir:        server.Config.CompletedDir,
 		FinalizeMode:        server.Config.FinalizeMode,
 		FFmpegEncoder:       server.Config.FFmpegEncoder,
@@ -129,8 +184,8 @@ func SaveSettings() error {
 	if err != nil {
 		return fmt.Errorf("marshal settings: %w", err)
 	}
-	if err := os.MkdirAll("./conf", 0700); err != nil {
-		return fmt.Errorf("mkdir conf: %w", err)
+	if err := ensureConfDir(); err != nil {
+		return err
 	}
 	if err := os.WriteFile(settingsFile, b, 0600); err != nil {
 		return fmt.Errorf("write settings: %w", err)
@@ -141,10 +196,10 @@ func SaveSettings() error {
 // LoadSettings reads persisted cookies and user-agent from disk and applies
 // them to server.Config, overriding any CLI-provided values.
 func LoadSettings() error {
-	b, err := os.ReadFile(settingsFile)
-	if os.IsNotExist(err) {
-		return nil
+	if err := EnsureConfigPlaceholders(); err != nil {
+		return fmt.Errorf("ensure config placeholders: %w", err)
 	}
+	b, err := os.ReadFile(settingsFile)
 	if err != nil {
 		return fmt.Errorf("read settings: %w", err)
 	}
@@ -157,6 +212,28 @@ func LoadSettings() error {
 	}
 	if s.UserAgent != "" {
 		server.Config.UserAgent = s.UserAgent
+	}
+	if s.BrowserMode != "" {
+		server.Config.BrowserMode = entity.NormalizeBrowserMode(s.BrowserMode)
+	}
+	if s.BrowserPath != "" {
+		server.Config.BrowserPath = s.BrowserPath
+	}
+	if s.BrowserProfileDir != "" {
+		server.Config.BrowserProfileDir = s.BrowserProfileDir
+	}
+	if s.BrowserHelperURL != "" {
+		server.Config.BrowserHelperURL = s.BrowserHelperURL
+	}
+	if s.BrowserHelperToken != "" {
+		server.Config.BrowserHelperToken = s.BrowserHelperToken
+	}
+	if s.BrowserDebugPort > 0 {
+		server.Config.BrowserDebugPort = s.BrowserDebugPort
+	}
+	server.Config.BrowserBootstrap = s.BrowserBootstrap
+	if s.BrowserBootstrapURL != "" {
+		server.Config.BrowserBootstrapURL = s.BrowserBootstrapURL
 	}
 	server.Config.NtfyURL = s.NtfyURL
 	server.Config.NtfyTopic = s.NtfyTopic
@@ -204,6 +281,19 @@ func LoadSettings() error {
 	}
 	if server.Config.FFmpegPreset == "" {
 		server.Config.FFmpegPreset = "medium"
+	}
+	server.Config.BrowserMode = entity.NormalizeBrowserMode(server.Config.BrowserMode)
+	if server.Config.BrowserPath == "" {
+		server.Config.BrowserPath = "chromium"
+	}
+	if server.Config.BrowserProfileDir == "" {
+		server.Config.BrowserProfileDir = "./conf/browser-profile"
+	}
+	if server.Config.BrowserDebugPort <= 0 {
+		server.Config.BrowserDebugPort = 9222
+	}
+	if server.Config.BrowserBootstrapURL == "" {
+		server.Config.BrowserBootstrapURL = server.Config.Domain
 	}
 	return nil
 }
@@ -319,6 +409,12 @@ func migrateLegacyPatternConflicts(config []*entity.ChannelConfig) (bool, error)
 
 // SaveConfig saves the current channels and state to a JSON file.
 func (m *Manager) SaveConfig() error {
+	if server.Config != nil && server.Config.Username != "" {
+		// Single-channel CLI runs are ephemeral and should not rewrite the
+		// persisted web UI channel list.
+		return nil
+	}
+
 	var config []*entity.ChannelConfig
 
 	m.Channels.Range(func(key, value any) bool {
@@ -330,8 +426,8 @@ func (m *Manager) SaveConfig() error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	if err := os.MkdirAll("./conf", 0700); err != nil {
-		return fmt.Errorf("mkdir all conf: %w", err)
+	if err := ensureConfDir(); err != nil {
+		return err
 	}
 	if err := os.WriteFile(channelsFile, b, 0600); err != nil {
 		return fmt.Errorf("write file: %w", err)
@@ -344,8 +440,8 @@ func saveChannelConfig(config []*entity.ChannelConfig) error {
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
 	}
-	if err := os.MkdirAll("./conf", 0700); err != nil {
-		return fmt.Errorf("mkdir all conf: %w", err)
+	if err := ensureConfDir(); err != nil {
+		return err
 	}
 	if err := os.WriteFile(channelsFile, b, 0600); err != nil {
 		return fmt.Errorf("write file: %w", err)
@@ -355,10 +451,10 @@ func saveChannelConfig(config []*entity.ChannelConfig) error {
 
 // LoadConfig loads the channels from JSON and starts them.
 func (m *Manager) LoadConfig() error {
-	b, err := os.ReadFile(channelsFile)
-	if os.IsNotExist(err) {
-		return nil
+	if err := EnsureConfigPlaceholders(); err != nil {
+		return fmt.Errorf("ensure config placeholders: %w", err)
 	}
+	b, err := os.ReadFile(channelsFile)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}

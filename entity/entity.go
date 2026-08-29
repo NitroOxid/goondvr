@@ -59,6 +59,18 @@ func NormalizeFinalizeMode(mode string) string {
 	}
 }
 
+// NormalizeBrowserMode returns a supported browser fetch mode.
+func NormalizeBrowserMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "local":
+		return "local"
+	case "remote":
+		return "remote"
+	default:
+		return "off"
+	}
+}
+
 // ChannelID returns the stable internal identifier for a site+username pair.
 func ChannelID(site, username string) string {
 	return NormalizeSite(site) + "__" + username
@@ -94,28 +106,38 @@ type ChannelInfo struct {
 
 // Config holds the configuration for the application.
 type Config struct {
-	Version         string
-	Username        string
-	Site            string
-	AdminUsername   string
-	AdminPassword   string
-	Framerate       int
-	Resolution      int
-	Pattern         string
-	MaxDuration     int
-	MaxFilesize     int
-	Port            string
-	Interval        int
-	Cookies         string
-	UserAgent       string
-	Domain          string
-	CompletedDir    string
-	FinalizeMode    string
-	FFmpegEncoder   string
-	FFmpegContainer string
-	FFmpegQuality   int
-	FFmpegPreset    string
-	Debug           bool
+	Version             string
+	Username            string
+	Site                string
+	AdminUsername       string
+	AdminPassword       string
+	Framerate           int
+	Resolution          int
+	Pattern             string
+	MaxDuration         int
+	MaxFilesize         int
+	Port                string
+	Interval            int
+	Cookies             string
+	UserAgent           string
+	Domain              string
+	CompletedDir        string
+	FinalizeMode        string
+	FFmpegEncoder       string
+	FFmpegContainer     string
+	FFmpegQuality       int
+	FFmpegPreset        string
+	Debug               bool
+	BrowserMode         string
+	BrowserPath         string
+	BrowserProfileDir   string
+	BrowserHelperURL    string
+	BrowserHelperToken  string
+	BrowserHelperServer bool
+	BrowserHelperBind   string
+	BrowserDebugPort    int
+	BrowserBootstrap    bool
+	BrowserBootstrapURL string
 
 	// Notification settings — persisted in settings.json, configured via web UI.
 	NtfyURL             string

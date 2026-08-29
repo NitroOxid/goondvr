@@ -214,14 +214,26 @@
                     <div class="ts-divider"></div>
 
                     <div class="ts-content is-vertically-padded">
-                        <!-- Cookies -->
+                        <!-- Browser Import -->
                         <div class="ts-control is-wide">
+                            <div class="label">Browser Import</div>
+                            <div class="content">
+                                <div class="ts-input">
+                                    <textarea name="browser_export" rows="6" placeholder="Paste Firefox 'Copy as cURL' here to auto-import cookies and User-Agent"></textarea>
+                                </div>
+                                <div class="ts-text is-description has-top-spaced-small">Recommended for quick updates: paste a fresh Firefox <code>Copy as cURL</code> request for <code>chatvideocontext</code> or <code>biocontext</code>, then save. The app will extract the cookie jar and User-Agent automatically, and it skips room-specific <code>tbu_*</code> cookies.</div>
+                            </div>
+                        </div>
+                        <!-- / Browser Import -->
+
+                        <!-- Cookies -->
+                        <div class="ts-control is-wide has-top-spaced-large">
                             <div class="label">Cookies</div>
                             <div class="content">
                                 <div class="ts-input">
-                                    <textarea name="cookies" rows="5">{{ .Config.Cookies }}</textarea>
+                                    <textarea name="cookies" rows="7" placeholder="Paste the full browser Cookie header or a semicolon-separated cookie string">{{ .Config.Cookies }}</textarea>
                                 </div>
-                                <div class="ts-text is-description has-top-spaced-small">Use semicolons to separate multiple cookies, e.g., "key1=value1; key2=value2". See <a class="ts-text is-link" href="https://github.com/teacat/goondvr/?tab=readme-ov-file#-cookies--user-agent" target="_blank">README</a> for details.</div>
+                                <div class="ts-text is-description has-top-spaced-small">Paste the full cookie string from your browser when values rotate. Raw <code>Cookie:</code> lines are accepted and persisted in <code>conf/settings.json</code>. If you paste only <code>cf_clearance=...</code>, the app updates that cookie while keeping the rest of the stored cookie jar. Room-specific <code>tbu_*</code> cookies are dropped automatically. See <a class="ts-text is-link" href="https://github.com/teacat/goondvr/?tab=readme-ov-file#-cookies--user-agent" target="_blank">README</a> for details.</div>
                             </div>
                         </div>
                         <!-- / Cookies -->
@@ -237,6 +249,72 @@
                             </div>
                         </div>
                         <!-- / User Agent -->
+
+                        <!-- Browser Fetch -->
+                        <div class="ts-control is-wide has-top-spaced-large">
+                            <div class="label">Browser Fallback</div>
+                            <div class="content">
+                                <div class="ts-content is-padded is-secondary">
+                                    <div class="ts-grid is-relaxed is-2-columns">
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Mode</div>
+                                            <div class="ts-select has-top-spaced-small">
+                                                <select name="browser_mode">
+                                                    <option value="off" {{ if eq .Config.BrowserMode "off" }}selected{{ end }}>Off</option>
+                                                    <option value="local" {{ if eq .Config.BrowserMode "local" }}selected{{ end }}>Local Chromium</option>
+                                                    <option value="remote" {{ if eq .Config.BrowserMode "remote" }}selected{{ end }}>Remote Helper</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Browser Path</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="text" name="browser_path" value="{{ .Config.BrowserPath }}" placeholder="chromium" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Profile Directory</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="text" name="browser_profile_dir" value="{{ .Config.BrowserProfileDir }}" placeholder="./conf/browser-profile" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Helper URL</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="text" name="browser_helper_url" value="{{ .Config.BrowserHelperURL }}" placeholder="http://vm-host:8091" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Helper Token</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="text" name="browser_helper_token" value="{{ .Config.BrowserHelperToken }}" placeholder="optional bearer token" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Debug Port</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="number" name="browser_debug_port" value="{{ .Config.BrowserDebugPort }}" placeholder="9222" min="1" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Bootstrap URL</div>
+                                            <div class="ts-input has-top-spaced-small">
+                                                <input type="text" name="browser_bootstrap_url" value="{{ .Config.BrowserBootstrapURL }}" placeholder="https://chaturbate.com/" />
+                                            </div>
+                                        </div>
+                                        <div class="column">
+                                            <div class="ts-text is-bold">Bootstrap Visible Browser</div>
+                                            <label class="ts-checkbox has-top-spaced-small">
+                                                <input type="checkbox" name="browser_bootstrap" {{ if .Config.BrowserBootstrap }}checked{{ end }} />
+                                                Open Chromium with this profile when helper mode starts
+                                            </label>
+                                        </div>
+                                    </div>
+                                    <div class="ts-text is-description has-top-spaced">Use <code>local</code> to reuse a persistent Chromium profile on the same machine after you have manually passed Cloudflare once. Use <code>remote</code> to call a helper running on another machine, such as your Ubuntu VM. In helper mode, enabling bootstrap opens a visible Chromium window automatically so you can solve Cloudflare with the same shared profile.</div>
+                                </div>
+                            </div>
+                        </div>
+                        <!-- / Browser Fetch -->
 
                         <!-- Completed Directory -->
                         <div class="ts-control is-wide has-top-spaced-large">

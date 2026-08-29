@@ -126,6 +126,18 @@ Available options:
 --interval value            Check if the channel is online every N minutes (default: 1)
 --cookies value             Cookies to use in the request (format: key=value; key2=value2)
 --user-agent value          Custom User-Agent for the request
+--browser-mode value        Browser-backed Chaturbate fallback: off, local, or remote (default: "off")
+--browser-path value        Browser executable for local/helper browser mode (default: "chromium")
+--browser-profile-dir value Persistent browser profile directory for browser mode (default: "./conf/browser-profile")
+--browser-helper-url value  Remote browser helper base URL, used when browser-mode=remote
+--browser-helper-token value
+                            Bearer token for remote browser helper authentication
+--browser-helper            Run browser helper server instead of the DVR app
+--browser-helper-bind value Bind address for browser helper server (default: "127.0.0.1:8091")
+--browser-debug-port value  Chromium remote debugging port for the persistent browser session (default: 9222)
+--browser-bootstrap         Open a visible Chromium window for helper-mode Cloudflare validation
+--browser-bootstrap-url value
+                            Initial URL to open for browser bootstrap (default: "https://chaturbate.com/")
 --stripchat-pdkey value     Manually specify Stripchat pdkey if keys have rotated
 --domain value              Chaturbate domain to use (default: "https://chaturbate.com/")
 --completed-dir value       Directory to move fully closed recordings into (default: <recording dir>/completed)
@@ -192,7 +204,28 @@ You can set Cookies and User-Agent via the Web UI or command-line arguments.
 
 ![localhost_8080_ (4)](https://github.com/user-attachments/assets/cbd859a9-4255-404b-b6bf-fa89342f7258)
 
-_Note: Use semicolons to separate multiple cookies, e.g., `key1=value1; key2=value2`._
+_Note: You can paste either a semicolon-separated cookie string, e.g. `key1=value1; key2=value2`, or a full browser `Cookie:` header. The value is persisted in `conf/settings.json` and can be updated later from the Web UI._
+
+On first start, the app creates local placeholder files in `conf/settings.json` and `conf/channels.json` automatically if they do not exist. Those files are intended to stay local and hold your machine-specific settings and cookies. In this repository, `conf/` is gitignored, so your local cookies and channels are not included in normal commits.
+
+The easiest update path in the Web UI is the `Browser Import` box: paste Firefox `Copy as cURL` output for a successful `chatvideocontext` or `biocontext` request, and the app will extract the cookie jar and User-Agent automatically.
+
+Room-specific `tbu_*` cookies are ignored automatically and are not needed for normal Chaturbate recording.
+
+If copied cookies stop working, enable `Browser Fallback` in Settings. The app can either:
+
+- use a persistent local Chromium profile on the same machine
+- call a remote browser helper running on another machine, such as a desktop Ubuntu VM
+
+## Recommended Quick Start
+
+For most Chaturbate setups, this is the simplest order of operations:
+
+1. Start with the Web UI `Browser Import` box and paste a fresh Firefox `Copy as cURL` request for `chatvideocontext` or `biocontext`.
+2. If copied cookies and User-Agent stop working, enable `Browser Fallback`.
+3. Use `local` browser mode when the DVR and Chromium profile are on the same machine.
+4. Use `remote` browser mode when the DVR is headless and a separate desktop or VM can run Chromium.
+5. Keep `Cookies` and `User-Agent` in Settings as the manual override path when you need to inspect or replace values directly.
 
 ## ☁️ Bypass Cloudflare
 
@@ -200,15 +233,19 @@ _Note: Use semicolons to separate multiple cookies, e.g., `key1=value1; key2=val
 
     (Keep refresh with F5 if the check doesn't appear)
 
-2. **DevTools (F12)** → **Application** → **Cookies** → `https://chaturbate.com` → Copy the `cf_clearance` value
+2. Preferred quick-refresh path: in Firefox DevTools, use **Network** → find a successful `chatvideocontext` or `biocontext` request → **Copy as cURL** → paste it into the Web UI `Browser Import` box.
+
+3. Manual path: **DevTools (F12)** → **Application** → **Cookies** → `https://chaturbate.com`
+
+    For the most reliable results, copy the full cookie string used by Firefox for Chaturbate, not just `cf_clearance`.
 
 ![sshot-2025-04-30-146](https://github.com/user-attachments/assets/69f4061b-29a2-48a7-ad57-0c86148805e2)
 
-3. User-Agent can be found using [WhatIsMyBrowser](https://www.whatismybrowser.com/detect/what-is-my-user-agent/), now run with `-cookies` and `-user-agent`:
+4. User-Agent can be found using [WhatIsMyBrowser](https://www.whatismybrowser.com/detect/what-is-my-user-agent/), now run with `-cookies` and `-user-agent`:
 
     ```bash
     $ ./goondvr -u yamiodymel \
-        -cookies "cf_clearance=PASTE_YOUR_CF_CLEARANCE_HERE" \
+        -cookies "cf_clearance=...; csrftoken=...; __cf_bm=...; agreeterms=1" \
         -user-agent "PASTE_YOUR_USER_AGENT_HERE"
     ```
 
@@ -216,9 +253,61 @@ _Note: Use semicolons to separate multiple cookies, e.g., `key1=value1; key2=val
 
     ```bash
     $ ./goondvr -u yamiodymel \
-        -cookies "cf_clearance=i975JyJSMZUuEj2kIqfaClPB2dLomx3.iYo6RO1IIRg-1746019135-1.2.1.1-2CX..." \
+        -cookies "cf_clearance=i975JyJSMZUuEj2kIqfaClPB2dLomx3.iYo6RO1IIRg-1746019135-1.2.1.1-2CX...; csrftoken=...; __cf_bm=..." \
         -user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)..."
     ```
+
+    You can also paste a full header directly:
+
+    ```bash
+    $ ./goondvr -u yamiodymel \
+        -cookies "Cookie: cf_clearance=...; csrftoken=...; __cf_bm=...; agreeterms=1" \
+        -user-agent "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:154.0) Gecko/20100101 Firefox/154.0"
+    ```
+
+## 🌐 Browser Fallback
+
+If Cloudflare starts blocking copied cookies and headers, the app can fall back to a real Chromium session for Chaturbate API requests.
+
+### Local Mode
+
+Use this when the DVR and browser profile live on the same machine:
+
+```bash
+$ ./goondvr --browser-mode local --browser-path chromium --browser-profile-dir ./conf/browser-profile
+```
+
+After you have manually passed the challenge once with that Chromium profile, the app will reuse that persistent browser session for later Chaturbate API fetches.
+
+### Remote Helper Mode
+
+Use this when the DVR runs on a headless server and a separate VM has the browser session.
+
+Run the helper on the VM:
+
+```bash
+$ ./goondvr --browser-helper \
+    --browser-path chromium \
+    --browser-profile-dir ./conf/browser-profile \
+    --browser-helper-bind 0.0.0.0:8091 \
+    --browser-bootstrap \
+    --browser-bootstrap-url https://chaturbate.com/ \
+    --browser-helper-token "CHANGE_ME"
+```
+
+Then point the DVR server at it:
+
+```bash
+$ ./goondvr --browser-mode remote \
+    --browser-helper-url http://VM_IP:8091 \
+    --browser-helper-token "CHANGE_ME"
+```
+
+The Web UI exposes the same `Browser Fallback` settings, plus a `Browser Import` textarea for quick cookie/User-Agent refreshes.
+
+When `--browser-bootstrap` is enabled in helper mode, the helper opens a visible Chromium window automatically using the same profile directory it later reuses for background fetches. This is the easiest way to solve the Cloudflare challenge on a desktop VM without running a separate manual Chromium command first.
+
+If a channel is offline, the browser fallback now classifies it as offline rather than surfacing a Cloudflare block just because the direct API request was challenged first.
 
 ## 🕵️ Record Private Shows
 

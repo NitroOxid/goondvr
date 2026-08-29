@@ -9,6 +9,7 @@ import (
 
 	"github.com/HeapOfChaos/goondvr/config"
 	"github.com/HeapOfChaos/goondvr/entity"
+	"github.com/HeapOfChaos/goondvr/internal"
 	"github.com/HeapOfChaos/goondvr/manager"
 	"github.com/HeapOfChaos/goondvr/router"
 	"github.com/HeapOfChaos/goondvr/server"
@@ -26,7 +27,7 @@ const logo = `
 func main() {
 	app := &cli.App{
 		Name:    "goondvr",
-		Version: "3.1.1",
+		Version: "4.0.0",
 		Usage:   "Record your favorite streams automatically. 😎🫵",
 		Flags: []cli.Flag{
 			&cli.StringFlag{
@@ -88,7 +89,7 @@ func main() {
 			},
 			&cli.StringFlag{
 				Name:  "cookies",
-				Usage: "Cookies to use in the request (format: key=value; key2=value2)",
+				Usage: "Cookies to use in the request (full browser cookie string or key=value; key2=value2)",
 				Value: "",
 			},
 			&cli.StringFlag{
@@ -137,6 +138,56 @@ func main() {
 				Value: false,
 			},
 			&cli.StringFlag{
+				Name:  "browser-mode",
+				Usage: "Browser-backed fallback for Chaturbate API fetches: off, local, or remote",
+				Value: "off",
+			},
+			&cli.StringFlag{
+				Name:  "browser-path",
+				Usage: "Browser executable for local browser-mode or helper mode",
+				Value: "chromium",
+			},
+			&cli.StringFlag{
+				Name:  "browser-profile-dir",
+				Usage: "Persistent browser profile directory for browser-mode",
+				Value: "./conf/browser-profile",
+			},
+			&cli.StringFlag{
+				Name:  "browser-helper-url",
+				Usage: "Remote browser helper base URL, used when browser-mode=remote",
+				Value: "",
+			},
+			&cli.StringFlag{
+				Name:  "browser-helper-token",
+				Usage: "Bearer token for remote browser helper authentication",
+				Value: "",
+			},
+			&cli.BoolFlag{
+				Name:  "browser-helper",
+				Usage: "Run browser helper server instead of the DVR app",
+				Value: false,
+			},
+			&cli.StringFlag{
+				Name:  "browser-helper-bind",
+				Usage: "Bind address for browser helper server",
+				Value: "127.0.0.1:8091",
+			},
+			&cli.IntFlag{
+				Name:  "browser-debug-port",
+				Usage: "Remote debugging port for the persistent Chromium browser session",
+				Value: 9222,
+			},
+			&cli.BoolFlag{
+				Name:  "browser-bootstrap",
+				Usage: "Launch a visible browser window with the shared profile for manual Cloudflare validation",
+				Value: false,
+			},
+			&cli.StringFlag{
+				Name:  "browser-bootstrap-url",
+				Usage: "Initial URL to open for browser bootstrap",
+				Value: "https://chaturbate.com/",
+			},
+			&cli.StringFlag{
 				Name:  "stripchat-pdkey",
 				Usage: "Stripchat MOUFLON v2 decryption key (auto-extracted if omitted)",
 				Value: "",
@@ -160,6 +211,10 @@ func start(c *cli.Context) error {
 	if err := manager.LoadSettings(); err != nil {
 		return fmt.Errorf("load settings: %w", err)
 	}
+	config.ApplyExplicitOverrides(server.Config, c)
+	if server.Config.BrowserHelperServer {
+		return internal.RunBrowserHelper(c.String("browser-helper-bind"))
+	}
 	server.Manager, err = manager.New()
 	if err != nil {
 		return fmt.Errorf("new manager: %w", err)
@@ -178,16 +233,21 @@ func start(c *cli.Context) error {
 
 	// init web interface if username is not provided
 	if server.Config.Username == "" {
-		fmt.Printf("👋 Visit http://localhost:%s to use the Web UI\n\n\n", c.String("port"))
+		fmt.Printf("👋 Starting Web UI on http://localhost:%s\n", c.String("port"))
+		fmt.Printf("📁 Config files: %s and %s\n\n", "conf/settings.json", "conf/channels.json")
 
 		if err := server.Manager.LoadConfig(); err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
 
+		fmt.Printf("Loaded %d channel(s). Server is ready.\n\n", len(server.Manager.ChannelInfo()))
+
 		return router.SetupRouter().Run(":" + c.String("port"))
 	}
 
 	// else create a channel with the provided username
+	fmt.Printf("🎯 Starting single-channel mode for %s (%s)\n\n", c.String("username"), server.Config.Site)
+
 	if err := server.Manager.CreateChannel(&entity.ChannelConfig{
 		IsPaused:    false,
 		Username:    c.String("username"),

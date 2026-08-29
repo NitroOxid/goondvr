@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -101,18 +103,12 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
+	if server.Config.Debug && shouldDumpDebugResponse(resp, b) {
+		dumpDebugResponse(req.URL.String(), resp, b)
+	}
+
 	// Check for Cloudflare protection
-	if strings.Contains(string(b), "<title>Just a moment...</title>") {
-		if server.Config.Debug {
-			fmt.Printf("[DEBUG] CF response for %s (status %d)\n", req.URL, resp.StatusCode)
-			tmpFile, ferr := os.CreateTemp("", "chaturbate-debug-cf-*.html")
-			if ferr == nil {
-				if _, werr := tmpFile.Write(b); werr == nil {
-					fmt.Printf("[DEBUG]   Full body written to: %s\n", tmpFile.Name())
-				}
-				tmpFile.Close()
-			}
-		}
+	if isCloudflareBlockPage(resp, b) {
 		return nil, ErrCloudflareBlocked
 	}
 	// Check for Age Verification
@@ -136,6 +132,9 @@ func (h *Req) CreateRequest(ctx context.Context, url string) (*http.Request, con
 		return nil, cancel, err
 	}
 	h.SetRequestHeaders(req)
+	if server.Config.Debug {
+		dumpDebugRequest(req)
+	}
 	return req, cancel, nil
 }
 
@@ -154,8 +153,12 @@ func (h *Req) DoRequest(req *http.Request) (string, error) {
 		return "", fmt.Errorf("read body: %w", err)
 	}
 
+	if server.Config.Debug && shouldDumpDebugResponse(resp, b) {
+		dumpDebugResponse(req.URL.String(), resp, b)
+	}
+
 	// Check for Cloudflare protection
-	if strings.Contains(string(b), "<title>Just a moment...</title>") {
+	if isCloudflareBlockPage(resp, b) {
 		return "", ErrCloudflareBlocked
 	}
 	// Check for Age Verification
@@ -180,6 +183,16 @@ func (h *Req) SetRequestHeaders(req *http.Request) {
 		req.Header.Set("Referer", ref)
 		req.Header.Set("Origin", strings.TrimRight(ref, "/"))
 	} else {
+		req.Header.Set("Accept", "*/*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+		req.Header.Set("Priority", "u=0")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.Header.Set("Referer", deriveBrowserReferer(req.URL))
+
 		// X-Requested-With helps bypass Cloudflare on chaturbate.com page fetches.
 		// Do NOT send it to CDN media hosts (mmcdn.com) as it may cause rejection.
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
@@ -187,29 +200,337 @@ func (h *Req) SetRequestHeaders(req *http.Request) {
 	if server.Config.UserAgent != "" {
 		req.Header.Set("User-Agent", server.Config.UserAgent)
 	}
-	if server.Config.Cookies != "" {
-		cookies := ParseCookies(server.Config.Cookies)
-		for name, value := range cookies {
-			req.AddCookie(&http.Cookie{Name: name, Value: value})
-		}
+	if cookieHeader := NormalizeCookieString(server.Config.Cookies); cookieHeader != "" {
+		req.Header.Set("Cookie", cookieHeader)
 	}
 }
 
-// ParseCookies converts a cookie string into a map.
-func ParseCookies(cookieStr string) map[string]string {
-	cookies := make(map[string]string)
-	pairs := strings.Split(cookieStr, ";")
+func NormalizeCookieString(cookieStr string) string {
+	cookieStr = strings.TrimSpace(cookieStr)
+	if cookieStr == "" {
+		return ""
+	}
 
-	// Iterate over each cookie pair and extract key-value pairs
-	for _, pair := range pairs {
-		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
-		if len(parts) == 2 {
-			// Trim spaces around key and value
-			key := strings.TrimSpace(parts[0])
-			value := strings.TrimSpace(parts[1])
-			// Store cookie name and value in the map
-			cookies[key] = value
+	lines := strings.FieldsFunc(cookieStr, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	parts := make([]string, 0, len(lines))
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if i == 0 && strings.HasPrefix(strings.ToLower(line), "cookie:") {
+			line = strings.TrimSpace(line[len("cookie:"):])
+		}
+		if line != "" {
+			parts = append(parts, line)
 		}
 	}
-	return cookies
+	return strings.Join(parts, "; ")
+}
+
+func SanitizeCookieString(cookieStr string) string {
+	return serializeCookieEntries(filterImportedCookieEntries(parseCookieEntries(cookieStr)))
+}
+
+type cookieEntry struct {
+	name  string
+	value string
+}
+
+func parseCookieEntries(cookieStr string) []cookieEntry {
+	cookieStr = NormalizeCookieString(cookieStr)
+	if cookieStr == "" {
+		return nil
+	}
+
+	pairs := strings.Split(cookieStr, ";")
+	entries := make([]cookieEntry, 0, len(pairs))
+	for _, pair := range pairs {
+		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			continue
+		}
+		entries = append(entries, cookieEntry{name: name, value: value})
+	}
+	return entries
+}
+
+func filterImportedCookieEntries(entries []cookieEntry) []cookieEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	filtered := make([]cookieEntry, 0, len(entries))
+	for _, entry := range entries {
+		if shouldIgnoreImportedCookie(entry.name) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func shouldIgnoreImportedCookie(name string) bool {
+	name = strings.TrimSpace(strings.ToLower(name))
+	return strings.HasPrefix(name, "tbu_")
+}
+
+func serializeCookieEntries(entries []cookieEntry) string {
+	if len(entries) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		parts = append(parts, fmt.Sprintf("%s=%s", entry.name, entry.value))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// MergeCookieUpdate preserves the existing cookie jar when the user only pastes
+// a replacement cf_clearance value from the browser. Any fuller cookie input
+// replaces the stored cookie string as-is.
+func MergeCookieUpdate(existing, incoming string) string {
+	incoming = SanitizeCookieString(incoming)
+	if incoming == "" {
+		return ""
+	}
+
+	incomingEntries := parseCookieEntries(incoming)
+	if len(incomingEntries) != 1 || incomingEntries[0].name != "cf_clearance" {
+		return incoming
+	}
+
+	existingEntries := parseCookieEntries(SanitizeCookieString(existing))
+	if len(existingEntries) == 0 {
+		return incoming
+	}
+
+	updated := false
+	for i := range existingEntries {
+		if existingEntries[i].name == "cf_clearance" {
+			existingEntries[i].value = incomingEntries[0].value
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		existingEntries = append(existingEntries, incomingEntries[0])
+	}
+
+	return serializeCookieEntries(filterImportedCookieEntries(existingEntries))
+}
+
+// ExtractBrowserImport parses a browser-exported request blob, such as Firefox
+// "Copy as cURL", and extracts the Cookie and User-Agent headers when present.
+func ExtractBrowserImport(raw string) (cookieHeader, userAgent string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", ""
+	}
+
+	headerLines := extractHeaderLines(raw)
+	for _, headerLine := range headerLines {
+		name, value, ok := strings.Cut(headerLine, ":")
+		if !ok {
+			continue
+		}
+
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "cookie":
+			cookieHeader = serializeCookieEntries(filterImportedCookieEntries(parseCookieEntries(value)))
+		case "user-agent":
+			userAgent = strings.TrimSpace(value)
+		}
+	}
+
+	return cookieHeader, userAgent
+}
+
+func extractHeaderLines(raw string) []string {
+	normalized := strings.ReplaceAll(raw, "\\\r\n", " ")
+	normalized = strings.ReplaceAll(normalized, "\\\n", " ")
+
+	var headers []string
+	segments := strings.Split(normalized, "-H ")
+	if len(segments) > 1 {
+		for _, segment := range segments[1:] {
+			segment = strings.TrimSpace(segment)
+			if segment == "" {
+				continue
+			}
+
+			headerLine, ok := parseQuotedSegment(segment)
+			if ok {
+				headers = append(headers, headerLine)
+			}
+		}
+		if len(headers) > 0 {
+			return headers
+		}
+	}
+
+	for _, line := range strings.FieldsFunc(raw, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(line), "cookie:") || strings.HasPrefix(strings.ToLower(line), "user-agent:") {
+			headers = append(headers, line)
+		}
+	}
+	return headers
+}
+
+func parseQuotedSegment(segment string) (string, bool) {
+	if segment == "" {
+		return "", false
+	}
+
+	quote := segment[0]
+	if quote != '\'' && quote != '"' {
+		return "", false
+	}
+
+	end := strings.IndexByte(segment[1:], quote)
+	if end < 0 {
+		return "", false
+	}
+
+	return segment[1 : 1+end], true
+}
+
+func cookieDebugInfo(cookieStr string) []string {
+	cookieStr = NormalizeCookieString(cookieStr)
+	if cookieStr == "" {
+		return nil
+	}
+
+	pairs := strings.Split(cookieStr, ";")
+	info := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		parts := strings.SplitN(strings.TrimSpace(pair), "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if name == "" {
+			continue
+		}
+		info = append(info, fmt.Sprintf("%s(len=%d)", name, len(value)))
+	}
+	sort.Strings(info)
+	return info
+}
+
+func shouldDumpDebugResponse(resp *http.Response, body []byte) bool {
+	return resp.StatusCode >= 400 || looksLikeHTMLResponse(resp, body) || isCloudflareBlockPage(resp, body)
+}
+
+func looksLikeHTMLResponse(resp *http.Response, body []byte) bool {
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/html") {
+		return true
+	}
+
+	bodyStart := strings.ToLower(strings.TrimSpace(string(body[:min(len(body), 512)])))
+	return strings.HasPrefix(bodyStart, "<!doctype html") ||
+		strings.HasPrefix(bodyStart, "<html") ||
+		strings.Contains(bodyStart, "<head") ||
+		strings.Contains(bodyStart, "<body")
+}
+
+func isCloudflareBlockPage(resp *http.Response, body []byte) bool {
+	content := strings.ToLower(string(body))
+	return strings.Contains(content, "<title>just a moment...</title>") ||
+		strings.Contains(content, "cf-browser-verification") ||
+		strings.Contains(content, "cf_chl_") ||
+		strings.Contains(content, "challenge-platform") ||
+		(strings.Contains(content, "cloudflare") && looksLikeHTMLResponse(resp, body))
+}
+
+func dumpDebugResponse(url string, resp *http.Response, body []byte) {
+	fmt.Printf("[DEBUG] HTTP response for %s (status %d)\n", url, resp.StatusCode)
+	tmpFile, err := os.CreateTemp("", "chaturbate-debug-response-*.http")
+	if err != nil {
+		fmt.Printf("[DEBUG]   Failed to create temp file: %v\n", err)
+		return
+	}
+	defer tmpFile.Close()
+
+	if _, err := fmt.Fprintf(tmpFile, "URL: %s\nStatus: %s\n", url, resp.Status); err != nil {
+		fmt.Printf("[DEBUG]   Failed to write temp file: %v\n", err)
+		return
+	}
+	if err := resp.Header.Write(tmpFile); err != nil {
+		fmt.Printf("[DEBUG]   Failed to write headers: %v\n", err)
+		return
+	}
+	if _, err := tmpFile.WriteString("\n"); err != nil {
+		fmt.Printf("[DEBUG]   Failed to write separator: %v\n", err)
+		return
+	}
+	if _, err := tmpFile.Write(body); err != nil {
+		fmt.Printf("[DEBUG]   Failed to write body: %v\n", err)
+		return
+	}
+
+	fmt.Printf("[DEBUG]   Full response written to: %s\n", tmpFile.Name())
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func deriveBrowserReferer(target *url.URL) string {
+	base := strings.TrimRight(server.Config.Domain, "/")
+	if base == "" {
+		base = "https://chaturbate.com"
+	}
+	if target == nil {
+		return base + "/"
+	}
+
+	trimmedPath := strings.Trim(target.Path, "/")
+	parts := strings.Split(trimmedPath, "/")
+	if len(parts) >= 3 && parts[0] == "api" {
+		username := parts[2]
+		if username != "" {
+			return fmt.Sprintf("%s/%s/", base, username)
+		}
+	}
+
+	return base + "/"
+}
+
+func dumpDebugRequest(req *http.Request) {
+	fmt.Printf("[DEBUG] HTTP request %s %s\n", req.Method, req.URL.String())
+
+	headerNames := make([]string, 0, len(req.Header))
+	for name := range req.Header {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+
+	for _, name := range headerNames {
+		if strings.EqualFold(name, "Cookie") {
+			continue
+		}
+		fmt.Printf("[DEBUG]   %s: %s\n", name, strings.Join(req.Header.Values(name), ", "))
+	}
+
+	cookieInfo := cookieDebugInfo(req.Header.Get("Cookie"))
+	if len(cookieInfo) == 0 {
+		fmt.Println("[DEBUG]   Cookies: none")
+		return
+	}
+	fmt.Printf("[DEBUG]   Cookies: %s\n", strings.Join(cookieInfo, ", "))
 }

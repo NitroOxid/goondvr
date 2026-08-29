@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,12 +95,73 @@ func FetchStream(ctx context.Context, client *internal.Req, username string) (*S
 	apiURL := fmt.Sprintf("%sapi/chatvideocontext/%s/", server.Config.Domain, username)
 	body, err := client.Get(ctx, apiURL)
 	if err != nil {
+		if errors.Is(err, internal.ErrCloudflareBlocked) {
+			if body, berr := internal.BrowserAPIGet(ctx, server.Config.Domain, apiURL); berr == nil {
+				if stream, perr := parseAPIStream(username, body); perr == nil ||
+					errors.Is(perr, internal.ErrChannelOffline) ||
+					errors.Is(perr, internal.ErrPrivateStream) ||
+					errors.Is(perr, internal.ErrHiddenStream) ||
+					errors.Is(perr, internal.ErrRoomPasswordRequired) {
+					return stream, perr
+				} else if server.Config.Debug {
+					fmt.Printf("[DEBUG] browser API parse failed for %s stream fetch: %v\n", username, perr)
+				}
+			} else if server.Config.Debug {
+				fmt.Printf("[DEBUG] browser API fallback failed for %s stream fetch: %v\n", username, berr)
+			}
+			if stream, berr := fetchStreamFromBrowserPage(ctx, username); berr == nil || errors.Is(berr, internal.ErrChannelOffline) || errors.Is(berr, internal.ErrPrivateStream) || errors.Is(berr, internal.ErrHiddenStream) || errors.Is(berr, internal.ErrRoomPasswordRequired) {
+				return stream, berr
+			} else if server.Config.Debug {
+				fmt.Printf("[DEBUG] browser fallback failed for %s stream fetch: %v\n", username, berr)
+			}
+			return nil, fmt.Errorf("failed to get stream info: %w (browser fallback failed)", err)
+		}
 		return nil, fmt.Errorf("failed to get stream info: %w", err)
 	}
 
+	return parseAPIStream(username, body)
+}
+
+// bioResponse is the subset of fields we care about from the biocontext API.
+type bioResponse struct {
+	LastBroadcast string `json:"last_broadcast"`
+}
+
+// FetchLastBroadcast calls the biocontext API and returns the last_broadcast
+// time as a Unix timestamp, or 0 if unavailable.
+func FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
+	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
+	body, err := req.Get(ctx, apiURL)
+	if err != nil {
+		if errors.Is(err, internal.ErrCloudflareBlocked) {
+			if body, berr := internal.BrowserAPIGet(ctx, server.Config.Domain, apiURL); berr == nil {
+				if ts, perr := parseAPILastBroadcast(body); perr == nil {
+					return ts, nil
+				} else if server.Config.Debug {
+					fmt.Printf("[DEBUG] browser API parse failed for %s biocontext fetch: %v\n", username, perr)
+				}
+			} else if server.Config.Debug {
+				fmt.Printf("[DEBUG] browser API fallback failed for %s biocontext fetch: %v\n", username, berr)
+			}
+			if ts, berr := fetchLastBroadcastFromBrowserPage(ctx, username); berr == nil {
+				return ts, nil
+			} else if server.Config.Debug {
+				fmt.Printf("[DEBUG] browser fallback failed for %s biocontext fetch: %v\n", username, berr)
+			}
+			return 0, fmt.Errorf("fetch biocontext: %w (browser fallback failed)", err)
+		}
+		return 0, fmt.Errorf("fetch biocontext: %w", err)
+	}
+	return parseAPILastBroadcast(body)
+}
+
+func parseAPIStream(username, body string) (*Stream, error) {
 	var resp apiResponse
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return nil, fmt.Errorf("failed to parse stream info: %w", err)
+		if server.Config.Debug {
+			fmt.Printf("[DEBUG] API parse fallback for %s: %v\n", username, err)
+		}
+		return parseLooseAPIStream(body)
 	}
 
 	if resp.Code == "unauthorized" {
@@ -110,7 +172,6 @@ func FetchStream(ctx context.Context, client *internal.Req, username string) (*S
 		fmt.Printf("[DEBUG] API response for %s: room_status=%s hls_source=%v\n", username, resp.RoomStatus, resp.HLSSource != "")
 	}
 
-	// Always populate static metadata so the caller can update it even when offline.
 	meta := &Stream{
 		RoomTitle:        resp.RoomTitle,
 		Gender:           resp.Gender,
@@ -134,21 +195,18 @@ func FetchStream(ctx context.Context, client *internal.Req, username string) (*S
 	}
 }
 
-// bioResponse is the subset of fields we care about from the biocontext API.
-type bioResponse struct {
-	LastBroadcast string `json:"last_broadcast"`
-}
-
-// FetchLastBroadcast calls the biocontext API and returns the last_broadcast
-// time as a Unix timestamp, or 0 if unavailable.
-func FetchLastBroadcast(ctx context.Context, req *internal.Req, username string) (int64, error) {
-	apiURL := fmt.Sprintf("%sapi/biocontext/%s/", server.Config.Domain, username)
-	body, err := req.Get(ctx, apiURL)
-	if err != nil {
-		return 0, fmt.Errorf("fetch biocontext: %w", err)
-	}
+func parseAPILastBroadcast(body string) (int64, error) {
 	var bio bioResponse
 	if err := json.Unmarshal([]byte(body), &bio); err != nil {
+		if ts := extractJSONString(body, "last_broadcast"); ts != "" {
+			t, terr := time.Parse("2006-01-02T15:04:05.999", ts)
+			if terr == nil {
+				return t.Unix(), nil
+			}
+		}
+		if looksLikeHTMLDocument(body) {
+			return 0, nil
+		}
 		return 0, fmt.Errorf("parse biocontext: %w", err)
 	}
 	if bio.LastBroadcast == "" {
@@ -159,6 +217,150 @@ func FetchLastBroadcast(ctx context.Context, req *internal.Req, username string)
 		return 0, fmt.Errorf("parse last_broadcast: %w", err)
 	}
 	return t.Unix(), nil
+}
+
+func parseLooseAPIStream(body string) (*Stream, error) {
+	stream := &Stream{
+		HLSSource:        extractJSONString(body, "hls_source"),
+		RoomTitle:        extractJSONString(body, "room_title"),
+		Gender:           extractJSONString(body, "broadcaster_gender"),
+		SummaryCardImage: extractJSONString(body, "summary_card_image"),
+		NumViewers:       extractJSONInt(body, "num_viewers"),
+		EdgeRegion:       extractJSONString(body, "edge_region"),
+	}
+
+	roomStatus := extractJSONString(body, "room_status")
+	code := extractJSONString(body, "code")
+	if code == "unauthorized" {
+		return nil, internal.ErrRoomPasswordRequired
+	}
+	if stream.HLSSource != "" {
+		return stream, nil
+	}
+	switch roomStatus {
+	case "private":
+		return stream, internal.ErrPrivateStream
+	case "hidden":
+		return stream, internal.ErrHiddenStream
+	case "offline":
+		return stream, internal.ErrChannelOffline
+	}
+	if isGenericLobbyPage(body) || looksLikeHTMLDocument(body) || isRoomPageHTML(body) {
+		return stream, internal.ErrChannelOffline
+	}
+	return nil, fmt.Errorf("stream info body was not parseable")
+}
+
+func fetchStreamFromBrowserPage(ctx context.Context, username string) (*Stream, error) {
+	pageURL := fmt.Sprintf("%s%s/", server.Config.Domain, username)
+	body, err := internal.BrowserFetch(ctx, pageURL)
+	if err != nil {
+		return nil, fmt.Errorf("browser fetch room page: %w", err)
+	}
+
+	stream := &Stream{
+		HLSSource:        extractJSONString(body, "hls_source"),
+		RoomTitle:        extractJSONString(body, "room_title"),
+		Gender:           extractJSONString(body, "broadcaster_gender"),
+		SummaryCardImage: extractJSONString(body, "summary_card_image"),
+		NumViewers:       extractJSONInt(body, "num_viewers"),
+		EdgeRegion:       extractJSONString(body, "edge_region"),
+	}
+
+	roomStatus := extractJSONString(body, "room_status")
+	code := extractJSONString(body, "code")
+	if server.Config.Debug {
+		fmt.Printf("[DEBUG] browser page parse for %s: room_status=%q code=%q hls_source=%v\n", username, roomStatus, code, stream.HLSSource != "")
+	}
+	if code == "unauthorized" {
+		return nil, internal.ErrRoomPasswordRequired
+	}
+	if stream.HLSSource != "" {
+		return stream, nil
+	}
+	switch roomStatus {
+	case "private":
+		return stream, internal.ErrPrivateStream
+	case "hidden":
+		return stream, internal.ErrHiddenStream
+	case "offline":
+		return stream, internal.ErrChannelOffline
+	}
+	if isGenericLobbyPage(body) {
+		return stream, internal.ErrChannelOffline
+	}
+	return nil, fmt.Errorf("browser page did not contain stream info")
+}
+
+func fetchLastBroadcastFromBrowserPage(ctx context.Context, username string) (int64, error) {
+	pageURL := fmt.Sprintf("%s%s/", server.Config.Domain, username)
+	body, err := internal.BrowserFetch(ctx, pageURL)
+	if err != nil {
+		return 0, fmt.Errorf("browser fetch room page: %w", err)
+	}
+
+	lastBroadcast := extractJSONString(body, "last_broadcast")
+	if lastBroadcast == "" {
+		return 0, nil
+	}
+	t, err := time.Parse("2006-01-02T15:04:05.999", lastBroadcast)
+	if err != nil {
+		return 0, fmt.Errorf("parse last_broadcast: %w", err)
+	}
+	return t.Unix(), nil
+}
+
+var (
+	jsonStringFieldPattern = regexp.MustCompile(`"([a-zA-Z0-9_]+)"\s*:\s*"((?:\\.|[^"])*)"`)
+	jsonNumberFieldPattern = regexp.MustCompile(`"([a-zA-Z0-9_]+)"\s*:\s*([0-9]+)`)
+)
+
+func extractJSONString(body, field string) string {
+	matches := jsonStringFieldPattern.FindAllStringSubmatch(body, -1)
+	for _, match := range matches {
+		if len(match) != 3 || match[1] != field {
+			continue
+		}
+		value, err := strconv.Unquote(`"` + match[2] + `"`)
+		if err != nil {
+			return match[2]
+		}
+		return value
+	}
+	return ""
+}
+
+func extractJSONInt(body, field string) int {
+	matches := jsonNumberFieldPattern.FindAllStringSubmatch(body, -1)
+	for _, match := range matches {
+		if len(match) != 3 || match[1] != field {
+			continue
+		}
+		v, err := strconv.Atoi(match[2])
+		if err != nil {
+			return 0
+		}
+		return v
+	}
+	return 0
+}
+
+func isGenericLobbyPage(body string) bool {
+	return strings.Contains(body, "<title>Chaturbate - 100% Free Chat &amp; Webcams</title>") ||
+		strings.Contains(body, "<title>Chaturbate - 100% Free Chat & Webcams</title>")
+}
+
+func looksLikeHTMLDocument(body string) bool {
+	trimmed := strings.TrimSpace(body)
+	return strings.HasPrefix(trimmed, "<!DOCTYPE html") ||
+		strings.HasPrefix(trimmed, "<html") ||
+		strings.Contains(trimmed, "<head") ||
+		strings.Contains(trimmed, "<body")
+}
+
+func isRoomPageHTML(body string) bool {
+	return strings.Contains(body, "'s Room @ Chaturbate") ||
+		strings.Contains(body, "Room @ Chaturbate - Chat in a Live Adult Video Chat Room Now")
 }
 
 type Stream struct {

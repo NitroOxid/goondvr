@@ -145,8 +145,17 @@ func Stats(c *gin.Context) {
 
 // UpdateConfigRequest represents the request body for updating configuration.
 type UpdateConfigRequest struct {
+	BrowserExport       string `form:"browser_export"`
 	Cookies             string `form:"cookies"`
 	UserAgent           string `form:"user_agent"`
+	BrowserMode         string `form:"browser_mode"`
+	BrowserPath         string `form:"browser_path"`
+	BrowserProfileDir   string `form:"browser_profile_dir"`
+	BrowserHelperURL    string `form:"browser_helper_url"`
+	BrowserHelperToken  string `form:"browser_helper_token"`
+	BrowserDebugPort    int    `form:"browser_debug_port"`
+	BrowserBootstrap    bool   `form:"browser_bootstrap"`
+	BrowserBootstrapURL string `form:"browser_bootstrap_url"`
 	CompletedDir        string `form:"completed_dir"`
 	FinalizeMode        string `form:"finalize_mode"`
 	FFmpegEncoder       string `form:"ffmpeg_encoder"`
@@ -173,8 +182,30 @@ func UpdateConfig(c *gin.Context) {
 		return
 	}
 
-	server.Config.Cookies = req.Cookies
-	server.Config.UserAgent = req.UserAgent
+	cookieInput := req.Cookies
+	userAgentInput := req.UserAgent
+	if req.BrowserExport != "" {
+		importedCookies, importedUserAgent := internal.ExtractBrowserImport(req.BrowserExport)
+		if importedCookies != "" {
+			cookieInput = importedCookies
+		}
+		if importedUserAgent != "" {
+			userAgentInput = importedUserAgent
+		}
+	}
+
+	server.Config.Cookies = internal.MergeCookieUpdate(server.Config.Cookies, cookieInput)
+	server.Config.UserAgent = userAgentInput
+	server.Config.BrowserMode = entity.NormalizeBrowserMode(req.BrowserMode)
+	server.Config.BrowserPath = strings.TrimSpace(req.BrowserPath)
+	server.Config.BrowserProfileDir = strings.TrimSpace(req.BrowserProfileDir)
+	server.Config.BrowserHelperURL = strings.TrimSpace(req.BrowserHelperURL)
+	server.Config.BrowserHelperToken = strings.TrimSpace(req.BrowserHelperToken)
+	if req.BrowserDebugPort > 0 {
+		server.Config.BrowserDebugPort = req.BrowserDebugPort
+	}
+	server.Config.BrowserBootstrap = req.BrowserBootstrap
+	server.Config.BrowserBootstrapURL = strings.TrimSpace(req.BrowserBootstrapURL)
 	server.Config.CompletedDir = req.CompletedDir
 	server.Config.FinalizeMode = entity.NormalizeFinalizeMode(req.FinalizeMode)
 	server.Config.FFmpegEncoder = req.FFmpegEncoder
