@@ -281,7 +281,14 @@ func (ch *Channel) handleSegmentForMonitor(runID uint64, b []byte, duration floa
 	}
 
 	if isMP4InitSegment(b) {
+		if normalized, err := chaturbate.NormalizeFragmentedInitForRecording(b); err == nil {
+			b = normalized
+		} else if server.Config.Debug {
+			ch.Verbose("mp4 init normalization skipped: %v", err)
+		}
 		ch.mp4InitSegment = append(ch.mp4InitSegment[:0], b...)
+		ch.fileMu.Unlock()
+		return nil
 	}
 	if ch.FileExt == ".mp4" && ch.Filesize == 0 && !isMP4InitSegment(b) && len(ch.mp4InitSegment) > 0 {
 		n, err := ch.File.Write(ch.mp4InitSegment)

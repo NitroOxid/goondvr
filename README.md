@@ -126,7 +126,7 @@ Available options:
 --interval value            Check if the channel is online every N minutes (default: 1)
 --cookies value             Cookies to use in the request (format: key=value; key2=value2)
 --user-agent value          Custom User-Agent for the request
---browser-mode value        Browser-backed Chaturbate fallback: off, local, or remote (default: "off")
+--browser-mode value        Browser-backed fallback for Chaturbate and Stripchat: off, local, or remote (default: "off")
 --browser-path value        Browser executable for local/helper browser mode (default: "chromium")
 --browser-profile-dir value Persistent browser profile directory for browser mode (default: "./conf/browser-profile")
 --browser-helper-url value  Remote browser helper base URL, used when browser-mode=remote
@@ -138,7 +138,7 @@ Available options:
 --browser-bootstrap         Open a visible Chromium window for helper-mode Cloudflare validation
 --browser-bootstrap-url value
                             Initial URL to open for browser bootstrap (default: "https://chaturbate.com/")
---stripchat-pdkey value     Manually specify Stripchat pdkey if keys have rotated
+--stripchat-pdkey value     Manually specify a legacy Stripchat pdkey fallback when auto/browser detection fails
 --domain value              Chaturbate domain to use (default: "https://chaturbate.com/")
 --completed-dir value       Directory to move fully closed recordings into (default: <recording dir>/completed)
 --finalize-mode value       Post-process closed recordings: none, remux, or transcode (default: "none")
@@ -217,6 +217,10 @@ If copied cookies stop working, enable `Browser Fallback` in Settings. The app c
 - use a persistent local Chromium profile on the same machine
 - call a remote browser helper running on another machine, such as a desktop Ubuntu VM
 
+For Chaturbate, browser fallback is mainly a Cloudflare recovery path when copied cookies and User-Agent stop working.
+
+For Stripchat, the browser-assisted path is now the more reliable recovery path when the direct API or player-derived keys change. Normal key rotation should not require a new app release as long as the helper can still observe the real playlist and segment requests.
+
 ## Recommended Quick Start
 
 For most Chaturbate setups, this is the simplest order of operations:
@@ -226,6 +230,12 @@ For most Chaturbate setups, this is the simplest order of operations:
 3. Use `local` browser mode when the DVR and Chromium profile are on the same machine.
 4. Use `remote` browser mode when the DVR is headless and a separate desktop or VM can run Chromium.
 5. Keep `Cookies` and `User-Agent` in Settings as the manual override path when you need to inspect or replace values directly.
+
+## Stripchat Notes
+
+- Stripchat support now prefers automatic browser-observed playlist and segment discovery when the old API path breaks.
+- `--stripchat-pdkey` is kept as a manual compatibility fallback, but it is no longer the primary fix for ordinary key rotation.
+- If Stripchat breaks again, the first thing to check is whether the configured local or remote browser helper can still open the room page and observe live media requests.
 
 ## ☁️ Bypass Cloudflare
 

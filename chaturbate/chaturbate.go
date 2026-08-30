@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -401,8 +402,16 @@ func FetchPlaylist(ctx context.Context, hlsSource string, resolution, framerate 
 	// Format: #EXT-X-MOUFLON:PSCH:v2:{pkey}
 	// The variant URLs in the master omit the pkey; it must be appended when fetching.
 	var mouflonSuffix string
-	pkey := stripchat.ParsePKeyFromMaster(resp)
+	pkey := stripchat.ParsePKeyFromURL(hlsSource)
+	if pkey == "" {
+		pkey = stripchat.ParsePKeyFromMaster(resp)
+	}
 	if pkey != "" {
+		resolvedPKey := stripchat.ResolveMediaPKey(ctx, pkey)
+		if resolvedPKey != "" {
+			pkey = resolvedPKey
+		}
+
 		// Build the query suffix needed for variant playlist URLs.
 		mouflonSuffix = fmt.Sprintf("&psch=v2&pkey=%s", pkey)
 
@@ -428,8 +437,10 @@ func FetchPlaylist(ctx context.Context, hlsSource string, resolution, framerate 
 		return nil, err
 	}
 	if mouflonSuffix != "" {
-		playlist.PlaylistURL += mouflonSuffix
-		if playlist.AudioPlaylistURL != "" {
+		if stripchat.ParsePKeyFromURL(playlist.PlaylistURL) == "" {
+			playlist.PlaylistURL += mouflonSuffix
+		}
+		if playlist.AudioPlaylistURL != "" && stripchat.ParsePKeyFromURL(playlist.AudioPlaylistURL) == "" {
 			playlist.AudioPlaylistURL += mouflonSuffix
 		}
 	}
@@ -439,7 +450,8 @@ func FetchPlaylist(ctx context.Context, hlsSource string, resolution, framerate 
 }
 
 func ParsePlaylist(resp, hlsSource string, resolution, framerate int) (*Playlist, error) {
-	p, _, err := m3u8.DecodeFrom(strings.NewReader(resp), true)
+	normalized := normalizeM3U8(resp)
+	p, _, err := safeDecodeFrom(strings.NewReader(normalized))
 	if err != nil {
 		if server.Config.Debug {
 			fmt.Printf("[DEBUG] master playlist parse failed: %v\n", err)
@@ -453,12 +465,31 @@ func ParsePlaylist(resp, hlsSource string, resolution, framerate int) (*Playlist
 		return nil, fmt.Errorf("failed to decode m3u8 playlist: %w", err)
 	}
 
-	masterPlaylist, ok := p.(*m3u8.MasterPlaylist)
-	if !ok {
-		return nil, errors.New("invalid master playlist format")
+	if masterPlaylist, ok := p.(*m3u8.MasterPlaylist); ok {
+		return PickPlaylist(masterPlaylist, hlsSource, resolution, framerate)
 	}
 
-	return PickPlaylist(masterPlaylist, hlsSource, resolution, framerate)
+	if mediaPlaylist, ok := p.(*m3u8.MediaPlaylist); ok {
+		return directMediaPlaylist(mediaPlaylist, hlsSource, resolution, framerate), nil
+	}
+
+	return nil, errors.New("invalid playlist format")
+}
+
+func directMediaPlaylist(pl *m3u8.MediaPlaylist, hlsSource string, resolution, framerate int) *Playlist {
+	fileExt := ".ts"
+	if strings.Contains(hlsSource, "doppiocdn") || pl.Map != nil {
+		fileExt = ".mp4"
+	}
+
+	rootURL := strings.SplitN(hlsSource, "?", 2)[0]
+	return &Playlist{
+		PlaylistURL: hlsSource,
+		RootURL:     rootURL,
+		Resolution:  resolution,
+		Framerate:   framerate,
+		FileExt:     fileExt,
+	}
 }
 
 // Playlist represents an HLS playlist containing variant streams.
@@ -870,13 +901,65 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 	var audioInitBytes []byte
 	initWritten := false
 	consecutiveErrors := 0
+	videoTimescale := uint32(0)
+	audioTimescale := uint32(0)
 
-	// Per-track tfdt base times captured from the first segment of each track.
-	// Subtracting these normalises timestamps to start from zero.
+	// Per-track tfdt base times and timescales captured from init/first segments.
+	// videoShift/audioShift align both tracks to the same presentation origin.
 	var videoTimeBase uint64
 	var audioTimeBase uint64
 	videoBaseSet := false
 	audioBaseSet := false
+	syncBaseComputed := false
+	var videoShift uint64
+	var audioShift uint64
+
+	type pairedChunk struct {
+		rawVideo []byte
+		rawAudio []byte
+		duration float64
+	}
+	type pendingSeg struct {
+		track    string
+		time     uint64
+		duration float64
+		data     []byte
+	}
+	var pendingPaired []pairedChunk
+	var pendingStripchat []pendingSeg
+
+	computeSyncShifts := func() {
+		if videoTimescale > 0 && audioTimescale > 0 {
+			videoStart := float64(videoTimeBase) / float64(videoTimescale)
+			audioStart := float64(audioTimeBase) / float64(audioTimescale)
+			minStart := videoStart
+			if audioStart < minStart {
+				minStart = audioStart
+			}
+			videoShift = videoTimeBase - uint64(math.Round(minStart*float64(videoTimescale)))
+			audioShift = audioTimeBase - uint64(math.Round(minStart*float64(audioTimescale)))
+		} else {
+			videoShift = videoTimeBase
+			audioShift = audioTimeBase
+		}
+		syncBaseComputed = true
+	}
+
+	writeMuxedChunk := func(rawVideo, rawAudio []byte, duration float64) error {
+		var chunk []byte
+		if rawVideo != nil {
+			chunk = append(chunk, shiftSegmentTfdt(rawVideo, 1, videoShift)...)
+		}
+		if rawAudio != nil {
+			audio := rewriteAudioMoofTrackID(rawAudio)
+			audio = shiftSegmentTfdt(audio, 2, audioShift)
+			chunk = append(chunk, audio...)
+		}
+		if len(chunk) == 0 {
+			return nil
+		}
+		return handler(chunk, duration)
+	}
 
 	for {
 		// Fetch video playlist
@@ -942,8 +1025,17 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 					return fmt.Errorf("get video init segment: %w", err)
 				}
 				videoInitBytes = b
+				videoTimescale = 0
+				if ts, ok := extractInitTrackTimescale(b); ok && ts > 0 {
+					videoTimescale = ts
+				}
 				lastVideoMapURI = v.Map.URI
 				initWritten = false
+				syncBaseComputed = false
+				videoBaseSet = false
+				audioBaseSet = false
+				pendingPaired = nil
+				pendingStripchat = nil
 			}
 			break
 		}
@@ -960,8 +1052,17 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 					return fmt.Errorf("get audio init segment: %w", err)
 				}
 				audioInitBytes = b
+				audioTimescale = 0
+				if ts, ok := extractInitTrackTimescale(b); ok && ts > 0 {
+					audioTimescale = ts
+				}
 				lastAudioMapURI = v.Map.URI
 				initWritten = false
+				syncBaseComputed = false
+				videoBaseSet = false
+				audioBaseSet = false
+				pendingPaired = nil
+				pendingStripchat = nil
 			}
 			break
 		}
@@ -1055,7 +1156,8 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				maxLen = len(newAudioSegs)
 			}
 			for i := 0; i < maxLen; i++ {
-				var chunk []byte
+				var rawVideo []byte
+				var rawAudio []byte
 				var chunkDuration float64
 
 				if i < len(newVideoSegs) {
@@ -1069,15 +1171,14 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 						retry.DelayType(retry.FixedDelay),
 					)
 					if err == nil {
+						rawVideo = segBytes
+						chunkDuration = vseg.duration
 						if !videoBaseSet {
 							if t, ok := extractMoofFirstTfdt(segBytes); ok {
 								videoTimeBase = t
 								videoBaseSet = true
 							}
 						}
-						segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
-						chunk = append(chunk, segBytes...)
-						chunkDuration = vseg.duration
 					}
 				}
 				if i < len(newAudioSegs) {
@@ -1093,33 +1194,42 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 					if err != nil {
 						fmt.Printf("[WARN] audio seg download failed: %v\n", err)
 					} else {
+						rawAudio = segBytes
 						if !audioBaseSet {
 							if t, ok := extractMoofFirstTfdt(segBytes); ok {
 								audioTimeBase = t
 								audioBaseSet = true
-								if server.Config.Debug {
-									fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-								}
 							}
 						}
-						if server.Config.Debug {
-							if rawTfdt, ok := extractMoofFirstTfdt(segBytes); ok {
-								var normalised uint64
-								if audioTimeBase > 0 && rawTfdt >= audioTimeBase {
-									normalised = rawTfdt - audioTimeBase
-								}
-								fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalised)
-							}
-						}
-						segBytes = rewriteAudioMoofTrackID(segBytes)
-						segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
-						chunk = append(chunk, segBytes...)
 					}
 				}
-				if len(chunk) > 0 {
-					if err := handler(chunk, chunkDuration); err != nil {
-						return fmt.Errorf("handler muxed segment group: %w", err)
+
+				if rawVideo == nil && rawAudio == nil {
+					continue
+				}
+				if !syncBaseComputed && videoBaseSet && audioBaseSet {
+					computeSyncShifts()
+				}
+				if !syncBaseComputed {
+					pendingPaired = append(pendingPaired, pairedChunk{
+						rawVideo: rawVideo,
+						rawAudio: rawAudio,
+						duration: chunkDuration,
+					})
+					continue
+				}
+
+				if len(pendingPaired) > 0 {
+					for _, pending := range pendingPaired {
+						if err := writeMuxedChunk(pending.rawVideo, pending.rawAudio, pending.duration); err != nil {
+							return fmt.Errorf("handler buffered muxed segment: %w", err)
+						}
 					}
+					pendingPaired = nil
+				}
+
+				if err := writeMuxedChunk(rawVideo, rawAudio, chunkDuration); err != nil {
+					return fmt.Errorf("handler muxed segment group: %w", err)
 				}
 			}
 
@@ -1127,14 +1237,8 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			continue
 		}
 
-		// Merge Stripchat by actual fragment decode time rather than playlist index.
-		type pendingSeg struct {
-			track    string
-			time     uint64
-			duration float64
-			data     []byte
-		}
-		var pending []pendingSeg
+		// Merge Stripchat by actual fragment presentation time rather than playlist index.
+		var cyclePending []pendingSeg
 
 		for _, vseg := range newVideoSegs {
 			vsegURL := vseg.url
@@ -1155,15 +1259,9 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 				videoTimeBase = rawTfdt
 				videoBaseSet = true
 			}
-
-			normalisedTime := rawTfdt
-			if videoBaseSet && rawTfdt >= videoTimeBase {
-				normalisedTime = rawTfdt - videoTimeBase
-			}
-			segBytes = shiftSegmentTfdt(segBytes, 1, videoTimeBase)
-			pending = append(pending, pendingSeg{
+			cyclePending = append(cyclePending, pendingSeg{
 				track:    "video",
-				time:     normalisedTime,
+				time:     rawTfdt,
 				duration: vseg.duration,
 				data:     segBytes,
 			})
@@ -1187,41 +1285,64 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			if !audioBaseSet && ok {
 				audioTimeBase = rawTfdt
 				audioBaseSet = true
-				if server.Config.Debug {
-					fmt.Printf("[DEBUG] muxed: audio base=%d\n", audioTimeBase)
-				}
 			}
-
-			normalisedTime := rawTfdt
-			if audioBaseSet && rawTfdt >= audioTimeBase {
-				normalisedTime = rawTfdt - audioTimeBase
-			}
-			if server.Config.Debug && ok {
-				fmt.Printf("[DEBUG] muxed: audio seg dur=%.3f raw_tfdt=%d norm=%d\n", aseg.duration, rawTfdt, normalisedTime)
-			}
-
-			segBytes = rewriteAudioMoofTrackID(segBytes)
-			segBytes = shiftSegmentTfdt(segBytes, 2, audioTimeBase)
-			pending = append(pending, pendingSeg{
+			cyclePending = append(cyclePending, pendingSeg{
 				track:    "audio",
-				time:     normalisedTime,
+				time:     rawTfdt,
 				duration: 0,
-				data:     segBytes,
+				data:     rewriteAudioMoofTrackID(segBytes),
 			})
 		}
 
-		sort.SliceStable(pending, func(i, j int) bool {
-			if pending[i].time != pending[j].time {
-				return pending[i].time < pending[j].time
+		if !syncBaseComputed && videoBaseSet && audioBaseSet {
+			computeSyncShifts()
+		}
+		if !syncBaseComputed {
+			pendingStripchat = append(pendingStripchat, cyclePending...)
+			<-time.After(1 * time.Second)
+			continue
+		}
+
+		pendingStripchat = append(pendingStripchat, cyclePending...)
+		trackTimescale := func(track string) uint32 {
+			if track == "video" {
+				return videoTimescale
 			}
-			return pending[i].track < pending[j].track
+			return audioTimescale
+		}
+		for i := range pendingStripchat {
+			if pendingStripchat[i].track == "video" {
+				if pendingStripchat[i].time >= videoShift {
+					pendingStripchat[i].time -= videoShift
+				} else {
+					pendingStripchat[i].time = 0
+				}
+				pendingStripchat[i].data = shiftSegmentTfdt(pendingStripchat[i].data, 1, videoShift)
+			} else {
+				if pendingStripchat[i].time >= audioShift {
+					pendingStripchat[i].time -= audioShift
+				} else {
+					pendingStripchat[i].time = 0
+				}
+				pendingStripchat[i].data = shiftSegmentTfdt(pendingStripchat[i].data, 2, audioShift)
+			}
+		}
+
+		sort.SliceStable(pendingStripchat, func(i, j int) bool {
+			timeI := scaleTrackTime(pendingStripchat[i].time, trackTimescale(pendingStripchat[i].track))
+			timeJ := scaleTrackTime(pendingStripchat[j].time, trackTimescale(pendingStripchat[j].track))
+			if timeI != timeJ {
+				return timeI < timeJ
+			}
+			return pendingStripchat[i].track < pendingStripchat[j].track
 		})
 
-		for _, seg := range pending {
+		for _, seg := range pendingStripchat {
 			if err := handler(seg.data, seg.duration); err != nil {
 				return fmt.Errorf("handler muxed segment: %w", err)
 			}
 		}
+		pendingStripchat = nil
 
 		<-time.After(1 * time.Second)
 	}

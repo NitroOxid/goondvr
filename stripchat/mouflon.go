@@ -5,7 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,23 +18,56 @@ import (
 	"github.com/HeapOfChaos/goondvr/server"
 )
 
-// knownPDKeys maps pkey (from #EXT-X-MOUFLON:PSCH:v2:{pkey}) to pdkey (decryption key).
-// The real pdkey is NOT in the visible JS ie object (those are decoys).
-// It must be found via Chrome DevTools breakpoint on _onPlaylistLoadingStateChanged
-// in the Closure scope (Ct object). See plugin.video.sc19#19.
-var knownPDKeys = map[string]string{
-	"Ook7quaiNgiyuhai": "EQueeGh2kaewa3ch",
-}
-
 var (
-	pdkeyMu       sync.Mutex
+	pdkeyMu        sync.Mutex
 	verifiedPDKey  string   // confirmed working pdkey (produces printable ASCII)
+	verifiedPDMask []byte   // derived XOR mask from a browser-observed decrypted segment URL
 	candidateKeys  []string // 16-char alphanumeric strings extracted from player JS
 	pdkeyFetched   bool
+	mediaPKey      string // current player-derived playlist pkey
+	mediaPKeyErr   bool
 )
 
+// ResolveMediaPKey returns the pkey value the current Stripchat MMP player uses
+// when it rewrites playlist URLs. This differs from the pkey in the master
+// playlist and must be derived from the current player JS.
+func ResolveMediaPKey(ctx context.Context, pkey string) string {
+	if pkey == "" {
+		return ""
+	}
+
+	pdkeyMu.Lock()
+	if mediaPKey != "" {
+		key := mediaPKey
+		pdkeyMu.Unlock()
+		return key
+	}
+	if mediaPKeyErr {
+		pdkeyMu.Unlock()
+		return pkey
+	}
+	pdkeyMu.Unlock()
+
+	key, err := fetchMediaPKeyFromPlayer(ctx)
+
+	pdkeyMu.Lock()
+	defer pdkeyMu.Unlock()
+	if err != nil || key == "" {
+		mediaPKeyErr = true
+		if err != nil {
+			fmt.Printf("[stripchat] WARNING: auto-extract MOUFLON pkey failed: %v\n", err)
+		}
+		return pkey
+	}
+	mediaPKey = key
+	if server.Config.Debug {
+		fmt.Printf("[DEBUG] mouflon: player pkey resolved (%d chars)\n", len(key))
+	}
+	return key
+}
+
 // ResolvePDKey returns the MOUFLON v2 decryption key for the given pkey.
-// Priority: manual override → verified key → triggers auto-extraction (candidates
+// Priority: manual override -> verified key -> triggers auto-extraction (candidates
 // will be tested against a live token later via TryFindWorkingKey).
 func ResolvePDKey(ctx context.Context, pkey string) string {
 	// Manual override always wins.
@@ -43,11 +80,6 @@ func ResolvePDKey(ctx context.Context, pkey string) string {
 
 	if verifiedPDKey != "" {
 		return verifiedPDKey
-	}
-
-	// Check hardcoded known keys.
-	if pdkey, ok := knownPDKeys[pkey]; ok {
-		return pdkey
 	}
 
 	// Auto-extract candidate keys from the mmp player JS (once).
@@ -82,6 +114,9 @@ func TryFindWorkingKey(sampleURI string) string {
 	if verifiedPDKey != "" {
 		return verifiedPDKey
 	}
+	if len(verifiedPDMask) > 0 {
+		return "derived"
+	}
 	if server.Config.StripchatPDKey != "" {
 		return server.Config.StripchatPDKey
 	}
@@ -104,12 +139,18 @@ func TryFindWorkingKey(sampleURI string) string {
 			return key
 		}
 		if server.Config.Debug {
-			fmt.Printf("[DEBUG] mouflon: candidate %q → non-printable (hex=%x)\n", key, result)
+			fmt.Printf("[DEBUG] mouflon: candidate %q -> non-printable (hex=%x)\n", key, result)
 		}
 	}
 
 	if len(candidateKeys) > 0 {
 		fmt.Printf("[stripchat] WARNING: none of %d candidate keys produced valid decryption\n", len(candidateKeys))
+	}
+	if len(verifiedPDMask) > 0 {
+		if server.Config.Debug {
+			fmt.Printf("[DEBUG] mouflon: using derived browser mask (%d bytes)\n", len(verifiedPDMask))
+		}
+		return "derived"
 	}
 	fmt.Println("[stripchat] Set the decryption key manually with --stripchat-pdkey.")
 	fmt.Println("[stripchat] To find the key, see: https://github.com/aitschti/plugin.video.sc19/issues/19")
@@ -121,8 +162,11 @@ func ResetPDKeyCache() {
 	pdkeyMu.Lock()
 	defer pdkeyMu.Unlock()
 	verifiedPDKey = ""
+	verifiedPDMask = nil
 	candidateKeys = nil
 	pdkeyFetched = false
+	mediaPKey = ""
+	mediaPKeyErr = false
 }
 
 // ParsePKeyFromMaster extracts the pkey from a master playlist's
@@ -139,6 +183,15 @@ func ParsePKeyFromMaster(masterBody string) string {
 		}
 	}
 	return ""
+}
+
+// ParsePKeyFromURL extracts a pkey query parameter from a Stripchat playlist URL.
+func ParsePKeyFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("pkey")
 }
 
 // reToken matches _NUMBER_TOKEN_NUMBER patterns in segment URIs.
@@ -175,6 +228,41 @@ func DecryptMouflonURI(uri, pdkey string) (string, error) {
 	return decryptedURI, nil
 }
 
+// LearnDecryptMaskFromPair derives the XOR mask used by Stripchat's MOUFLON URI
+// obfuscation from an encrypted playlist URI and the real segment URI observed
+// in a browser request. This avoids needing the original pdkey string.
+func LearnDecryptMaskFromPair(encryptedURI, resolvedURI string) bool {
+	encryptedMatch := reToken.FindStringSubmatch(encryptedURI)
+	resolvedMatch := reToken.FindStringSubmatch(resolvedURI)
+	if encryptedMatch == nil || resolvedMatch == nil {
+		return false
+	}
+
+	decoded, err := decodeEncryptedToken(encryptedMatch[2])
+	if err != nil {
+		return false
+	}
+
+	plain := []byte(resolvedMatch[2])
+	if len(decoded) == 0 || len(decoded) != len(plain) {
+		return false
+	}
+
+	mask := make([]byte, len(decoded))
+	for i := range decoded {
+		mask[i] = decoded[i] ^ plain[i]
+	}
+
+	pdkeyMu.Lock()
+	verifiedPDMask = mask
+	pdkeyMu.Unlock()
+
+	if server.Config.Debug {
+		fmt.Printf("[DEBUG] mouflon: derived browser mask from segment pair (%d bytes)\n", len(mask))
+	}
+	return true
+}
+
 // decryptToken extracts and decrypts the encrypted token from a URI.
 // Returns the raw decrypted bytes.
 func decryptToken(uri, pdkey string) ([]byte, error) {
@@ -184,6 +272,33 @@ func decryptToken(uri, pdkey string) ([]byte, error) {
 	}
 	encryptedPart := m[2]
 
+	decoded, err := decodeEncryptedToken(encryptedPart)
+	if err != nil {
+		return nil, err
+	}
+
+	var keyBytes []byte
+	if pdkey == "derived" {
+		pdkeyMu.Lock()
+		keyBytes = append([]byte(nil), verifiedPDMask...)
+		pdkeyMu.Unlock()
+		if len(keyBytes) == 0 {
+			return nil, fmt.Errorf("derived browser mask is unavailable")
+		}
+	} else {
+		hash := sha256.Sum256([]byte(pdkey))
+		keyBytes = hash[:]
+	}
+
+	// XOR with the derived/hash key bytes.
+	result := make([]byte, len(decoded))
+	for i, b := range decoded {
+		result[i] = b ^ keyBytes[i%len(keyBytes)]
+	}
+	return result, nil
+}
+
+func decodeEncryptedToken(encryptedPart string) ([]byte, error) {
 	// Reverse the encrypted string.
 	runes := []rune(encryptedPart)
 	for i, j := 0, len(runes)-1; i < j; i, j = i+1, j-1 {
@@ -199,14 +314,7 @@ func decryptToken(uri, pdkey string) ([]byte, error) {
 			return nil, fmt.Errorf("base64 decode %q: %w", reversed, err)
 		}
 	}
-
-	// XOR with cyclic SHA256(pdkey).
-	hash := sha256.Sum256([]byte(pdkey))
-	result := make([]byte, len(decoded))
-	for i, b := range decoded {
-		result[i] = b ^ hash[i%32]
-	}
-	return result, nil
+	return decoded, nil
 }
 
 // isPrintableASCII returns true if all bytes are printable ASCII (space through tilde).
@@ -239,15 +347,35 @@ func padBase64(s string) string {
 // strings as candidate decryption keys. The correct pdkey is hidden among these
 // candidates (Stripchat places decoy keys in visible objects to mislead scrapers).
 func fetchCandidateKeysFromPlayer(ctx context.Context) ([]string, error) {
-	// Use a media-style request (no X-Requested-With) to avoid 406 from Stripchat homepage.
-	req := internal.NewMediaReqWithReferer("https://stripchat.com/")
+	mainJS, err := fetchMMPMainJS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	candidates := extractCandidateStrings(mainJS)
+	if len(candidates) > 0 {
+		return candidates, nil
+	}
+	return nil, fmt.Errorf("no candidate keys extracted from player JS")
+}
 
+func fetchMediaPKeyFromPlayer(ctx context.Context) (string, error) {
+	mainJS, err := fetchMMPMainJS(ctx)
+	if err != nil {
+		return "", err
+	}
+	if key, ok := extractMediaPKey(mainJS); ok {
+		return key, nil
+	}
+	return "", fmt.Errorf("could not extract player pkey from mmp main.js")
+}
+
+func fetchMMPMainJS(ctx context.Context) (string, error) {
 	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	pageBody, err := req.Get(ctx2, "https://stripchat.com/")
+	pageBody, err := fetchStripchatPlayerPage(ctx2, "https://stripchat.com/")
 	if err != nil {
-		return nil, fmt.Errorf("fetch stripchat homepage: %w", err)
+		return "", fmt.Errorf("fetch stripchat homepage: %w", err)
 	}
 
 	// Find the mmp player base URL.
@@ -261,15 +389,31 @@ func fetchCandidateKeysFromPlayer(ctx context.Context) ([]string, error) {
 		baseURL = strings.TrimRight(m[1], "/") + "/"
 	}
 	if baseURL == "" {
-		return nil, fmt.Errorf("could not find mmp player base URL in Stripchat page")
+		baseURL = mmpBaseURLFromConfig(pageBody)
+	}
+	if baseURL == "" {
+		return "", fmt.Errorf("could not find mmp player base URL in Stripchat page")
 	}
 
 	if server.Config.Debug {
 		fmt.Printf("[DEBUG] mouflon: player base URL: %s\n", baseURL)
 	}
 
+	req := internal.NewMediaReqWithReferer("https://stripchat.com/")
+	ctxMain, cancelMain := context.WithTimeout(ctx, 15*time.Second)
+	mainJS, err := req.Get(ctxMain, baseURL+"main.js")
+	cancelMain()
+	if err == nil {
+		if server.Config.Debug {
+			fmt.Printf("[DEBUG] mouflon: fetched main.js (%d bytes)\n", len(mainJS))
+		}
+		return mainJS, nil
+	} else if server.Config.Debug {
+		fmt.Printf("[DEBUG] mouflon: fetch main.js failed: %v\n", err)
+	}
+
 	// Find chunk JS URLs.
-	reChunk := regexp.MustCompile(`chunk-[0-9a-f]{16,}\.js`)
+	reChunk := regexp.MustCompile(`(?:chunk-)?[0-9a-f]{5,}\.[0-9a-f]{8,}\.js|chunk-[0-9a-f]{16,}\.js`)
 	chunkNames := reChunk.FindAllString(pageBody, -1)
 	seen := map[string]bool{}
 	var uniqueChunks []string
@@ -284,7 +428,7 @@ func fetchCandidateKeysFromPlayer(ctx context.Context) ([]string, error) {
 		fmt.Printf("[DEBUG] mouflon: found %d chunk URLs\n", len(uniqueChunks))
 	}
 
-	// Fetch each chunk; find the one with MOUFLON code and extract candidates.
+	// Fetch each chunk; return the one with MOUFLON code.
 	for _, chunkName := range uniqueChunks {
 		chunkURL := baseURL + chunkName
 		ctx3, cancel2 := context.WithTimeout(ctx, 15*time.Second)
@@ -300,14 +444,77 @@ func fetchCandidateKeysFromPlayer(ctx context.Context) ([]string, error) {
 		if server.Config.Debug {
 			fmt.Printf("[DEBUG] mouflon: chunk %s contains MOUFLON code (%d bytes)\n", chunkName, len(jsBody))
 		}
-
-		candidates := extractCandidateStrings(jsBody)
-		if len(candidates) > 0 {
-			return candidates, nil
+		if strings.Contains(jsBody, "MOUFLON") {
+			return jsBody, nil
 		}
 	}
 
-	return nil, fmt.Errorf("no MOUFLON chunk found or no candidate keys extracted")
+	return "", fmt.Errorf("no MOUFLON chunk found")
+}
+
+func mmpBaseURLFromConfig(pageBody string) string {
+	origin := firstConfigValue(pageBody, "MMPExternalUnitedSourceOrigin")
+	if origin == "" {
+		origin = firstConfigValue(pageBody, "MMPExternalSourceOrigin")
+	}
+	version := firstConfigValue(pageBody, "mmpVersion")
+	if origin == "" || version == "" {
+		return ""
+	}
+	return strings.TrimRight(unescapeConfigString(origin), "/") + "/" + strings.TrimLeft(unescapeConfigString(version), "/") + "/"
+}
+
+func firstConfigValue(body, key string) string {
+	re := regexp.MustCompile(`"` + regexp.QuoteMeta(key) + `":"([^"]+)"`)
+	if m := re.FindStringSubmatch(body); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+func unescapeConfigString(s string) string {
+	s = strings.ReplaceAll(s, `\u002F`, "/")
+	s = strings.ReplaceAll(s, `\/`, "/")
+	return s
+}
+
+func fetchStripchatPlayerPage(ctx context.Context, pageURL string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return "", err
+	}
+	setStripchatBrowserHeaders(req)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func setStripchatBrowserHeaders(req *http.Request) {
+	ua := server.Config.UserAgent
+	if ua == "" {
+		ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Referer", "https://stripchat.com/")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
 }
 
 // re16Alphanum matches standalone 16-character alphanumeric strings (quoted in JS).
@@ -343,4 +550,73 @@ func isHexOnly(s string) bool {
 		}
 	}
 	return true
+}
+
+var (
+	reNativePKeyStart = regexp.MustCompile(`a\.uwghn\(a\[n\(777\)\]\(a\[o\(322\)\]\((\d+)\[n\(t\)\]\(36\)`)
+	reNativePKeyMid   = regexp.MustCompile(`(?s)\}\((\d+),(\d+)\),(\d+)\[s\(0,0,-309\)\]\(36\).*?\+(\d+)\.\.toString\(36\).*?,(\d+)\[s\(0,0,-309\)\]\(36\)`)
+	reNativePKeyEnd   = regexp.MustCompile(`(?s)\}\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)\)\)`)
+	rePlain16Alphanum = regexp.MustCompile(`^[a-zA-Z0-9]{16}$`)
+)
+
+func extractMediaPKey(js string) (string, bool) {
+	start := reNativePKeyStart.FindStringSubmatchIndex(js)
+	if len(start) == 0 {
+		return "", false
+	}
+	body := js[start[0]:]
+
+	startMatch := reNativePKeyStart.FindStringSubmatch(body)
+	midMatch := reNativePKeyMid.FindStringSubmatch(body)
+	endMatch := reNativePKeyEnd.FindStringSubmatch(body)
+	if len(startMatch) != 2 || len(midMatch) != 6 || len(endMatch) != 7 {
+		return "", false
+	}
+
+	rawNums := append([]string{}, startMatch[1])
+	rawNums = append(rawNums, midMatch[1:]...)
+	rawNums = append(rawNums, endMatch[1:]...)
+
+	nums := make([]int64, 0, len(rawNums))
+	for _, raw := range rawNums {
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		nums = append(nums, n)
+	}
+
+	key := strings.ToLower(strconv.FormatInt(nums[0], 36)) +
+		decodeSubtractTuple(nums[1:3], 25) +
+		strings.ToLower(strconv.FormatInt(nums[3], 36)) +
+		shiftBase36(nums[4], -13) +
+		strings.ToLower(strconv.FormatInt(nums[5], 36)) +
+		decodeSubtractTuple(nums[6:12], 58)
+
+	if len(key) != 16 || !rePlain16Alphanum.MatchString(key) {
+		return "", false
+	}
+	return key, true
+}
+
+func decodeSubtractTuple(nums []int64, extra int64) string {
+	if len(nums) < 2 {
+		return ""
+	}
+	seed := nums[0]
+	var b strings.Builder
+	for i := len(nums) - 1; i >= 1; i-- {
+		idx := int64(len(nums) - 1 - i)
+		b.WriteByte(byte(nums[i] - seed - extra - idx))
+	}
+	return b.String()
+}
+
+func shiftBase36(n, delta int64) string {
+	s := strings.ToLower(strconv.FormatInt(n, 36))
+	var b strings.Builder
+	for _, c := range s {
+		b.WriteRune(c + rune(delta))
+	}
+	return b.String()
 }

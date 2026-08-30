@@ -108,7 +108,7 @@ func (h *Req) GetBytes(ctx context.Context, url string) ([]byte, error) {
 	}
 
 	// Check for Cloudflare protection
-	if isCloudflareBlockPage(resp, b) {
+	if isCloudflareBlockedResponse(resp, b) {
 		return nil, ErrCloudflareBlocked
 	}
 	// Check for Age Verification
@@ -142,6 +142,10 @@ func (h *Req) CreateRequest(ctx context.Context, url string) (*http.Request, con
 // response body as a string. This allows callers to set extra headers on the
 // request before executing it (e.g. site-specific Referer or X-Requested-With).
 func (h *Req) DoRequest(req *http.Request) (string, error) {
+	if server.Config.Debug {
+		dumpDebugRequest(req)
+	}
+
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("client do: %w", err)
@@ -158,7 +162,7 @@ func (h *Req) DoRequest(req *http.Request) (string, error) {
 	}
 
 	// Check for Cloudflare protection
-	if isCloudflareBlockPage(resp, b) {
+	if isCloudflareBlockedResponse(resp, b) {
 		return "", ErrCloudflareBlocked
 	}
 	// Check for Age Verification
@@ -200,8 +204,57 @@ func (h *Req) SetRequestHeaders(req *http.Request) {
 	if server.Config.UserAgent != "" {
 		req.Header.Set("User-Agent", server.Config.UserAgent)
 	}
-	if cookieHeader := NormalizeCookieString(server.Config.Cookies); cookieHeader != "" {
-		req.Header.Set("Cookie", cookieHeader)
+	if shouldSendConfiguredCookies(req.URL) {
+		if cookieHeader := NormalizeCookieString(server.Config.Cookies); cookieHeader != "" {
+			req.Header.Set("Cookie", cookieHeader)
+		}
+	}
+}
+
+func shouldSendConfiguredCookies(target *url.URL) bool {
+	if target == nil {
+		return false
+	}
+
+	host := strings.ToLower(target.Hostname())
+	if host == "" {
+		return false
+	}
+
+	if configuredHost := configuredCookieHost(); configuredHost != "" {
+		return host == configuredHost || strings.HasSuffix(host, "."+configuredHost)
+	}
+
+	return host == "chaturbate.com" || strings.HasSuffix(host, ".chaturbate.com")
+}
+
+func configuredCookieHost() string {
+	domain := strings.TrimSpace(server.Config.Domain)
+	if domain == "" {
+		return ""
+	}
+	u, err := url.Parse(domain)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+func DumpParseFailure(label, body string) {
+	if !server.Config.Debug {
+		return
+	}
+	body = strings.TrimSpace(body)
+	end := len(body)
+	if end > 1200 {
+		end = 1200
+	}
+	fmt.Printf("[DEBUG] %s parse failure: body_len=%d\n", label, len(body))
+	if end > 0 {
+		fmt.Printf("[DEBUG] %s body preview:\n%s\n", label, body[:end])
+	}
+	if body == "" {
+		fmt.Printf("[DEBUG] %s body preview: <empty>\n", label)
 	}
 }
 
@@ -452,6 +505,28 @@ func isCloudflareBlockPage(resp *http.Response, body []byte) bool {
 		strings.Contains(content, "cf_chl_") ||
 		strings.Contains(content, "challenge-platform") ||
 		(strings.Contains(content, "cloudflare") && looksLikeHTMLResponse(resp, body))
+}
+
+func isCloudflareBlockedResponse(resp *http.Response, body []byte) bool {
+	if resp == nil {
+		return false
+	}
+	if isCloudflareBlockPage(resp, body) {
+		return true
+	}
+	if resp.StatusCode == http.StatusTeapot {
+		serverHeader := strings.ToLower(resp.Header.Get("Server"))
+		if strings.Contains(serverHeader, "cloudflare") {
+			return true
+		}
+		for _, cookie := range resp.Header.Values("Set-Cookie") {
+			lower := strings.ToLower(cookie)
+			if strings.Contains(lower, "__cf_bm=") || strings.Contains(lower, "_cfuvid=") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func dumpDebugResponse(url string, resp *http.Response, body []byte) {

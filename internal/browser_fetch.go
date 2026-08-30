@@ -34,6 +34,12 @@ type browserFetchResult struct {
 	Title    string `json:"title"`
 }
 
+type browserResourcesResult struct {
+	URLs     []string `json:"urls"`
+	FinalURL string   `json:"final_url"`
+	Title    string   `json:"title"`
+}
+
 type devToolsTarget struct {
 	ID                   string `json:"id"`
 	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
@@ -94,6 +100,17 @@ func BrowserAPIGet(ctx context.Context, pageURL, targetURL string) (string, erro
 	}
 }
 
+func BrowserResourceURLs(ctx context.Context, pageURL string) ([]string, error) {
+	switch server.Config.BrowserMode {
+	case "local":
+		return browserResourceURLsLocal(ctx, pageURL)
+	case "remote":
+		return browserResourceURLsRemote(ctx, pageURL)
+	default:
+		return nil, ErrCloudflareBlocked
+	}
+}
+
 func browserFetchLocal(ctx context.Context, targetURL string) (string, error) {
 	if err := os.MkdirAll(filepath.Clean(server.Config.BrowserProfileDir), 0700); err != nil {
 		return "", fmt.Errorf("mkdir browser profile dir: %w", err)
@@ -118,6 +135,23 @@ func browserAPIGetLocal(ctx context.Context, pageURL, targetURL string) (*browse
 		fmt.Printf("[DEBUG] browser API fetch via devtools: page=%s target=%s\n", pageURL, targetURL)
 	}
 	return fetchAPIViaDevTools(ctx, pageURL, targetURL)
+}
+
+func browserResourceURLsLocal(ctx context.Context, pageURL string) ([]string, error) {
+	if err := os.MkdirAll(filepath.Clean(server.Config.BrowserProfileDir), 0700); err != nil {
+		return nil, fmt.Errorf("mkdir browser profile dir: %w", err)
+	}
+	if err := ensureBrowserSession(ctx); err != nil {
+		return nil, err
+	}
+	if server.Config.Debug {
+		fmt.Printf("[DEBUG] browser resource scan via devtools: %s\n", pageURL)
+	}
+	result, err := fetchResourceURLsViaDevTools(ctx, pageURL)
+	if err != nil {
+		return nil, err
+	}
+	return result.URLs, nil
 }
 
 func browserFetchRemote(ctx context.Context, targetURL string) (string, error) {
@@ -196,6 +230,49 @@ func browserAPIGetRemote(ctx context.Context, pageURL, targetURL string) (string
 	return payload.Body, nil
 }
 
+func browserResourceURLsRemote(ctx context.Context, pageURL string) ([]string, error) {
+	if server.Config.BrowserHelperURL == "" {
+		return nil, fmt.Errorf("browser helper URL is empty")
+	}
+
+	fetchURL := strings.TrimRight(server.Config.BrowserHelperURL, "/") + "/resources?url=" + url.QueryEscape(pageURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("new browser helper resources request: %w", err)
+	}
+	if server.Config.BrowserHelperToken != "" {
+		req.Header.Set("Authorization", "Bearer "+server.Config.BrowserHelperToken)
+	}
+
+	resp, err := CreateTransport().RoundTrip(req)
+	if err != nil {
+		return nil, fmt.Errorf("call browser helper resources: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read browser helper resources response: %w", err)
+	}
+
+	var payload browserHelperResponse
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("decode browser helper resources response: %w", err)
+	}
+	if payload.Error != "" {
+		if payload.Error == ErrCloudflareBlocked.Error() {
+			return nil, ErrCloudflareBlocked
+		}
+		return nil, fmt.Errorf("browser helper: %s", payload.Error)
+	}
+
+	var urls []string
+	if err := json.Unmarshal([]byte(payload.Body), &urls); err != nil {
+		return nil, fmt.Errorf("decode browser helper resource URLs: %w", err)
+	}
+	return urls, nil
+}
+
 func RunBrowserHelper(bindAddr string) error {
 	if server.Config.BrowserBootstrap {
 		if err := LaunchBrowserBootstrap(server.Config.BrowserBootstrapURL); err != nil {
@@ -271,6 +348,45 @@ func RunBrowserHelper(bindAddr string) error {
 			payload.Body = result.Body
 			if server.Config.Debug {
 				fmt.Printf("[DEBUG] browser helper api fetch ok for %s: status=%d final=%s title=%q bytes=%d\n", targetURL, result.Status, result.FinalURL, result.Title, len(result.Body))
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(payload)
+	})
+	mux.HandleFunc("/resources", func(w http.ResponseWriter, r *http.Request) {
+		if server.Config.BrowserHelperToken != "" {
+			if got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); got != server.Config.BrowserHelperToken {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		pageURL := r.URL.Query().Get("url")
+		if pageURL == "" {
+			http.Error(w, "missing url", http.StatusBadRequest)
+			return
+		}
+		if server.Config.Debug {
+			fmt.Printf("[DEBUG] browser helper resource scan request: %s\n", pageURL)
+		}
+
+		result, err := fetchResourceURLsViaDevTools(r.Context(), pageURL)
+		payload := browserHelperResponse{}
+		if err != nil {
+			payload.Error = err.Error()
+			if server.Config.Debug {
+				fmt.Printf("[DEBUG] browser helper resource scan error for %s: %v\n", pageURL, err)
+			}
+		} else {
+			body, marshalErr := json.Marshal(result.URLs)
+			if marshalErr != nil {
+				payload.Error = fmt.Sprintf("marshal browser resource URLs: %v", marshalErr)
+			} else {
+				payload.Body = string(body)
+				if server.Config.Debug {
+					fmt.Printf("[DEBUG] browser helper resource scan ok for %s: final=%s title=%q urls=%d\n", pageURL, result.FinalURL, result.Title, len(result.URLs))
+				}
 			}
 		}
 
@@ -540,6 +656,72 @@ func fetchAPIViaDevTools(ctx context.Context, pageURL, targetURL string) (*brows
 	}
 	if out.Status >= 400 {
 		return nil, fmt.Errorf("browser api fetch returned status %d", out.Status)
+	}
+	return out, nil
+}
+
+func fetchResourceURLsViaDevTools(ctx context.Context, pageURL string) (*browserResourcesResult, error) {
+	target, err := createDevToolsTarget(ctx, pageURL)
+	if err != nil {
+		return nil, fmt.Errorf("create devtools target: %w", err)
+	}
+	defer closeDevToolsTarget(ctx, target.ID)
+
+	client, err := newCDPClient(ctx, target.WebSocketDebuggerURL)
+	if err != nil {
+		return nil, fmt.Errorf("connect devtools websocket: %w", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Call(ctx, "Page.enable", map[string]any{}); err != nil {
+		return nil, fmt.Errorf("page enable: %w", err)
+	}
+	if _, err := client.Call(ctx, "Runtime.enable", map[string]any{}); err != nil {
+		return nil, fmt.Errorf("runtime enable: %w", err)
+	}
+	if _, err := client.Call(ctx, "Page.navigate", map[string]any{"url": pageURL}); err != nil {
+		return nil, fmt.Errorf("page navigate: %w", err)
+	}
+
+	time.Sleep(5 * time.Second)
+
+	result, err := client.Call(ctx, "Runtime.evaluate", map[string]any{
+		"expression": `(function() {
+			const seen = new Set();
+			const urls = [];
+			for (const entry of performance.getEntriesByType("resource")) {
+				if (!entry || typeof entry.name !== "string" || entry.name === "" || seen.has(entry.name)) {
+					continue;
+				}
+				seen.add(entry.name);
+				urls.push(entry.name);
+			}
+			return {
+				urls,
+				final_url: window.location.href,
+				title: document.title
+			};
+		})()`,
+		"returnByValue": true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("runtime evaluate resources: %w", err)
+	}
+
+	var payload struct {
+		Result struct {
+			Value browserResourcesResult `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return nil, fmt.Errorf("decode runtime resources: %w", err)
+	}
+	out := &payload.Result.Value
+	if server.Config.Debug {
+		fmt.Printf("[DEBUG] browser resource scan: page=%s final=%s title=%q urls=%d\n", pageURL, out.FinalURL, out.Title, len(out.URLs))
+	}
+	if len(out.URLs) == 0 {
+		return nil, fmt.Errorf("browser resource scan returned no URLs")
 	}
 	return out, nil
 }
