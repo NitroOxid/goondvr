@@ -926,8 +926,8 @@ func (p *Playlist) watchMuxedSegments(ctx context.Context, handler WatchHandler)
 			if audioStart < minStart {
 				minStart = audioStart
 			}
-			videoShift = videoTimeBase - uint64(math.Round(minStart*float64(videoTimescale)))
-			audioShift = audioTimeBase - uint64(math.Round(minStart*float64(audioTimescale)))
+			videoShift = uint64(math.Round(minStart * float64(videoTimescale)))
+			audioShift = uint64(math.Round(minStart * float64(audioTimescale)))
 		} else {
 			videoShift = videoTimeBase
 			audioShift = audioTimeBase
